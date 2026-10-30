@@ -20,7 +20,7 @@
 - **D6** 开关沿检测 `st_prev_enabled`，**每块末尾无条件同步**（X4）。
 - **D7 v1.3（时序无关化）** `@serialize` = 非空占位（一条赋值语句），**不持久化任何变量**；用户参数持久化由 slider 自动保存承担；**st_booted 为运行态门控，在 @block 首块安装哨兵**（对 @init/@serialize 任何次序稳健）；重载 = 全零 + 首块哨兵（含直写 slider16=0）+ 重同步补发 → 释放态起步（§7.12）；停止→播放 = 状态存续 + `st_resync_pending`（@init 置 1）→ 首个启用块强制补发合成值（§7.16，修复 X1）。
 - **D8** 重同步破守卫：全部 `st_out_last[ch] = -1` 后调 io_send_synth。
-- **D9** slider11：0=全部/1–16=通道；slider12：`slider12:0<0,2,1>{64,66,67}-P12_CCTarget`，`cc_map[3]={64,66,67}`。
+- **D9 v1.3.2 勘误** slider11：0=全部/1–16=通道；slider12：`slider12:0<0,2,1{64,66,67}>-P12_CCTarget`（枚举在尖括号**内**——官方 js.php 原文形式，T1 审核裁定；原写法为笔误），`cc_map[3]={64,66,67}`。
 - **D10** 基址登记表（设计伪记法，落地基址常量）；grep 判据改**调用形**（I-4）；`|0` 操作定义：仅允许数组下标 `[…|0]`，时间戳/采样计数语境违规。
 - **D11** 全序 T1→T2→T3→T4→T5→T7；T6 并行。
 - **D12** `down_at = t_abs + gap_smp + max(hum_smp + jitter, 0)`。
@@ -31,7 +31,7 @@
 - **D18** kind：0=普通踩沿、1=换踏-低音窗、2=换踏-重复音窗、3=换踏-按钮（不开窗）；`win_lookup(3)`→无。
 - **D19** 命令槽影子 `slot_prev[3]`（独立上升沿）。
 - **D20 v1.3** 诊断 type：0/1=踩/抬沿（io_send_cc_raw 按**意图值**记）、2=换踏（ped_rep，含按钮路径）、3=硬件 CC（含关态跟踪）、4=复位、5=挂起翻转（仅实际翻转）、6=合成重同步（io_send_synth）。
-- **D21** st_reset(reason, t_abs)：清槽/按住表/pc/两窗/last_note=-1/tail_end=-1/直写 slider16=0；reason==2 → `st_tail_end = t_abs + cfg_tail_smp`（自愈）。
+- **D21 v1.3.1** st_reset(reason, t_abs)：清槽/按住表/pc/两窗/last_note=-1/tail_end=-1/直写 slider16=0；**st_auto_cc==127 → 对 st_ch_auto（空→索引0）逐通道立即 io_send_cc_raw(0, ch_i, 0)**（plan §3.2.15「立即释放」为准；D24 出口合并保证硬件踩住时输出保持硬件值）；**reason==2 → `st_tail_end = t_abs + cfg_tail_smp` 自愈兜底**（冗余无害，去重守卫抑制重复发送）。
 - **D22** st_on_note_on/off 均 3 参 `(t_abs, ch, note)`。
 - **D23** @init 末尾无条件 `cfg_sync_from_sliders()`（只读；采样率变化由 @slider 双保险再同步）。
 - **D24（新，B-1/X3 修复）** **`io_send_cc_raw` = 唯一自动沿出口，出口内合成**：`out = max(val, st_hw_cc)`；`out != st_out_last[ch]` 才 midisend；`st_out_last[ch]=out`；`st_auto_cc` 按 val 记（意图态）；`st_ch_auto[ch]=1`；diag 按意图值。硬件踩住时自动抬沿输出保持 max 值（不切延音）。
@@ -178,8 +178,8 @@ docs/使用说明.md  docs/首载检查单.md  tests/测试清单.md  tests/T2�
 | # | 目标 | 产出 | 验收标准 | 依赖 |
 |---|---|---|---|---|
 | T1 | 骨架+参数管线+基址表 | header、@init 常量/音名串/基址表、M1、四 section 骨架、@serialize 占位 | ① slider 恰 16（plan §4.2，D9 原文）；② @init 无 slider 写入、无运行态清零（哨兵在 @block 首块，D7）；③ @serialize 仅占位赋值；④ cfg_sync 覆盖 12+5；⑤ in/out_pin:none、gfx_hz=60；⑥ 基址表无重叠（含 cc_map/slot_prev/out_last[16]/ui_hit@2048[256]）；⑦ 12 音名串 59→B3 派生抽查 | — |
-| T2 | 引擎 M2+M3+M4（含 cmd_*） | io_/cmd_/st_/ped_ 全部 + @block 接线 | ① 审核 agent 产出 tests/T2语义对照.md：plan §3.2.1–3.2.16 逐条→代码位置全命中（I-7 对照表由审核方产出）；② §2.4 序列逐行核对（哨兵引导/D8 重同步/D14 跟踪式直通/D16 排序含 ≥块末顺延/D24 出口合成/D25 独立 synth）；③ 独占链+双命中丢弃+槽吸收；④ grep 差集空+禁词清单空；⑤ 无递归；⑥ LFSR/D12；⑦ 每块末 st_prev_enabled 同步（X4） | T1 |
-| T3 | 诊断 | M5 全部 + diag 调用点接线核查（D20 全型覆盖） | ① 环形缓冲纯数值；② 快照项齐全；③ type5 仅翻转、type2 覆盖按钮路径；④ 基址表更新 | T2 |
+| T2 | 引擎 M2+M3+M4（含 cmd_*） | io_/cmd_/st_/ped_ 全部 + @block 接线 + @init 补 `st_resync_pending=1;`（D7 载体，T1 审核挂账）+ cfg_set_param 契约注释（idx=slider 编号 1..12；slider12 传枚举索引）+ header 注释改 `//` | ① 审核 agent 产出 tests/T2语义对照.md：plan §3.2.1–3.2.16 逐条→代码位置全命中（I-7 对照表由审核方产出）+「SDS 伪记法→g_mem[基址+idx]」映射 + cfg_repeat_on↔cfg_repeat_repedal 映射；② §2.4 序列逐行核对（哨兵引导/D8 重同步/D14 跟踪式直通/D16 排序含 ≥块末顺延/D24 出口合成/D25 独立 synth）；③ 独占链+双命中丢弃+槽吸收；④ grep 差集空+禁词清单空+数组寻址纪律 grep `\b(st|ped|io|cmd|diag)_[A-Za-z0-9_]*\[` 为空（T1 审核挂账）；⑤ 无递归；⑥ LFSR/D12；⑦ 每块末 st_prev_enabled 同步（X4）；⑧ **填充顺序=叶子在前**：ped_→st_→cmd_→io_process_block 收尾（EEL2 先声明后调用）；diag 调用点以 `// T3: diag_log...` 注释占位（不带括号），diag 函数本体归 T3 | T1 |
+| T3 | 诊断 | M5 全部（diag_log/diag_snapshot 实现 + 基址登记）+ 替换 T2 的 `// T3:` 占位为真实调用 + @block 步7 接线 | ① 环形缓冲纯数值；② 快照项齐全；③ type5 仅翻转、type2 覆盖按钮路径；④ 基址表更新（diag 缓冲登记空闲区）；⑤ 替换后 grep 差集复跑为空 | T2 |
 | T4 | UI 框架+演奏页 | ui_ 框架+演奏页（≤550 行）+ **两档坐标表**（每控件 x/y/w/h @380×460 与 @760×920，I-8） | ① hit-test 每帧重建+首帧初始化；② 审核对坐标表逐行复算（越界/重叠/失真为零）+ 与代码派生式对照 + grep 裸坐标（颜色/字号外为零）；③ 参数全走 cfg_set_param（裸 sliderN= 仅命令槽与 slider16）；④ 演奏页=plan §4.3；⑤ draw_text 帮助函数就位 | T3 |
 | T5 | 高级/诊断/说明书页 | 三页（M6 总量 ≤900） | ① 高级页 7 控件对齐 §4.2（灰置读 cfg_chord）；② 诊断页读快照；③ 说明书页=安装一句话+5 要点短行+指向 docs；④ M6 行数核对 | T4 |
 | T6 | 文档 | docs/使用说明.md、docs/首载检查单.md、tests/测试清单.md | ① 覆盖 plan §4.3 五要点+§4.4 版本差异+§4.5 烘焙+低音锚定与三缓解+回放已烘焙关总开关+X12/X13 已知行为；② 首载检查单 5 分钟；③ 测试清单=plan §7 18 场景；④ MIDI learn 绑法官方核验（上升沿消费说明） | plan 定稿（并行） |
