@@ -1,5 +1,5 @@
 // Piano Auto Sustain — JSFX 实现，分节标记：M1 参数管线 / M2 MIDI I/O / M3 状态机 / M4 踏板调度 / M5 诊断 / M6 UI（M5 归 T3、M6 归 T4/T5）
-// 依据：sds.md v1.3（D1–D25）+ plan.md v0.5；当前进度 T2：骨架 + 参数管线 + 基址表（T1）+ 引擎 M2/M3/M4 与 @block 接线（T2，diag 调用点以 T3 占位注释预留）。
+// 依据：sds.md v1.3（D1–D25）+ plan.md v0.5；当前进度 T3：T1 骨架/参数管线/基址表 + T2 引擎 M2/M3/M4 + T3 诊断 M5（环形/快照/实发计数，占位已替换为真实调用）。
 
 desc:Piano Auto Sustain (MIDI)
 in_pin:none
@@ -51,10 +51,12 @@ CC_OFF = 0;    // 自动侧抬起值
  *   st_ch_auto@140[16]    g_ch_auto  = 140   140..155     通道发过自动 CC 标志
  *   st_out_last@156[16]   g_out_last = 156   156..171     通道上次合成输出值（I-3 按通道去重）
  *   slot_prev@172[3]      g_slot_prev= 172   172..174     命令槽影子（D19 独立上升沿）
+ *   diag 环形@176[256]    g_diag     = 176   176..431     M5 诊断环形日志 64 条 × 4 字段 [type,a,b,seq]（D20/T3）
+ *   diag 快照@432[17]     g_diag_snap= 432   432..448     M5 固定快照：+0 hw/+1 auto/+2 合成参考/+3 held/+4..15 bass_pc/+16 实发计数
  *   cc_map@512[3]         g_cc_map   = 512   512..514     CC 目标映射 {64,66,67}（D9）
  *   ui_hit@2048[256]      g_ui_hit   = 2048  2048..2303   UI hit-test（4页×16控件×4字段，N-7）
- * 逻辑区间 0..127/128..139/140..155/156..171/172..174/512..514/2048..2303 无重叠；
- * 后续任务新增数组须先在此登记新基址（避开上列区间并更新本表）。
+ * 逻辑区间 0..127/128..139/140..155/156..171/172..174/176..431/432..448/512..514/2048..2303 无重叠
+ * （diag 两区取空闲区 175..511 内的 176..448，T3 登记）；后续任务新增数组须先在此登记新基址（避开上列区间并更新本表）。
  */
 g_mem = 0;        // 锚变量：仅取其值 0 作「左侧值」，使 [g_基址 + idx] 即绝对地址
 g_note_cnt = 0;
@@ -62,6 +64,8 @@ g_bass_pc = 128;
 g_ch_auto = 140;
 g_out_last = 156;
 g_slot_prev = 172;
+g_diag = 176;        // M5 诊断环形日志基址（64 条 × 4 字段 = 256 槽，D20/T3）
+g_diag_snap = 432;   // M5 固定快照基址（17 槽，布局见基址登记表）
 g_cc_map = 512;
 g_ui_hit = 2048;
 
@@ -143,6 +147,44 @@ function cfg_restore_defaults() (
  *   局部暂存一律函数 local() 声明（跨函数互不可见；跨函数共享数据只走 g_mem 数组，N10）。
  */
 
+/* === M5 诊断（T3 / D20 / SDS §2.5）====
+ * 物理位置约束：diag_log 的最早调用方是叶子函数 io_send_cc_raw，EEL2 先声明后调用 → 本节先于全部调用方定义。
+ * 运行态标量登记（EEL2 未定义变量静默为 0，逐一登记；非持久化，D7 v1.3）：
+ *   diag_head（环形写头 0..63）  diag_seq（条目序号，单调递增不复位）  cc_sent_total（CC/合成流实发累计计数）
+ * 环形条目 4 字段 [type, a, b, seq]（g_diag，64 条覆盖写；seq 先自增再入槽 → 首条=1、未写槽=0 可辨）。
+ * a/b 语义随 type（D20）：
+ *   0/1 踩/抬沿 a=ch b=意图值；2 换踏 a=ch b=note+kind*1000（N-5：kind 读取者；实际 kind∈1..3）；
+ *   3 硬件 CC a=ch b=val；4 复位 a=reason b=t_abs（时间戳浮点原样、不取整）；
+ *   5 挂起翻转 a=ch（命令槽路径=-1 哨兵）b=翻转后新值；6 合成重同步 a=目标/fallback 通道 b=合成值。
+ * 快照固定槽布局（g_diag_snap 17 槽，同基址登记表）：
+ *   +0 st_hw_cc +1 st_auto_cc +2 out_last@156 之索引0（合成参考通道=索引0，D4/D17，设计自定）+3 st_held_total
+ *   +4..+15 低音 pc（st_bass_pc@128 十二项）+16 cc_sent_total
+ */
+
+// 数值环形日志（D20）：纯数值、覆盖写、head 环形推进；仅下标取整，时间戳/序号按 D10 保持浮点
+function diag_log(type, a, b) (
+  diag_seq = diag_seq + 1;
+  g_mem[g_diag + (diag_head|0)*4 + 0] = type;         // 槽0 type（条目步长 ×4：k 号条目占槽 4k..4k+3，B-1 修复）
+  g_mem[g_diag + (diag_head|0)*4 + 1] = a;            // 槽1 a
+  g_mem[g_diag + (diag_head|0)*4 + 2] = b;            // 槽2 b
+  g_mem[g_diag + (diag_head|0)*4 + 3] = diag_seq;     // 槽3 seq（读者据此判序/回绕）
+  diag_head = (diag_head + 1) % 64;                   // 环形推进（覆盖最旧条目）
+);
+
+// 每块末固定快照（SDS §2.5）：三真值 + held + bass_pc[12] + 实发计数 → g_diag_snap 固定槽
+function diag_snapshot() local(diag_i) (
+  g_mem[g_diag_snap + 0] = st_hw_cc;                  // 真值1 硬件 CC
+  g_mem[g_diag_snap + 1] = st_auto_cc;                // 真值2 自动意图态
+  g_mem[g_diag_snap + 2] = g_mem[g_out_last + 0];     // 真值3 合成参考值 = out_last[0]（D4/D17 fallback 参考通道）
+  g_mem[g_diag_snap + 3] = st_held_total;             // 按住总数
+  diag_i = 0;
+  while (diag_i < 12) (
+    g_mem[g_diag_snap + 4 + (diag_i|0)] = g_mem[g_bass_pc + (diag_i|0)];   // 低音 pc 12 项
+    diag_i = diag_i + 1;
+  );
+  g_mem[g_diag_snap + 16] = cc_sent_total;            // 实发累计计数
+);
+
 /* === M2 MIDI I/O · 出口原语（叶子先行）===
  * io_send_cc_raw 与 io_send_synth 仅依赖 midisend，是全插件的叶子函数；
  * 因 ped_/st_/cmd_ 各函数都调用它们，EEL2 先声明后调用 → 物理位置必须最前
@@ -150,16 +192,19 @@ function cfg_restore_defaults() (
  */
 
 // 自动沿唯一出口（D24）：出口内合并硬件 out = max(val, st_hw_cc)，按通道去重后 midisend（合成单流，plan §3.1 B1）；
-// 记 st_auto_cc = 意图值、并把 st_ch_auto 该通道标志置 1；diag 按意图值记（T3 接线）。
+// 记 st_auto_cc = 意图值、并把 st_ch_auto 该通道标志置 1；diag 按意图值记（D20 type0/1，已接线）。
 function io_send_cc_raw(off, ch, val) local(io_out) (
   io_out = max(val, st_hw_cc);                        // D24 出口合成：硬件踩住时自动抬沿不切延音
   io_out != g_mem[g_out_last + (ch|0)] ? (
     midisend(off, 0xB0 | ch, cfg_cc, io_out);         // 去重守卫（I-3）：与该通道上次输出相同则不重发（ch 由位运算得来，恒整）
+    cc_sent_total = cc_sent_total + 1;                // M5 实发计数：仅实际 midisend 递增（T3）
   ) : 0;
   g_mem[g_out_last + (ch|0)] = io_out;                // 恒写（等值时为无害重写）
   st_auto_cc = val;                                   // D24：意图态 0/127
   g_mem[g_ch_auto + (ch|0)] = 1;                      // D4：登记「该通道发过自动 CC」
-  // T3: diag_log 0/1 ch val —— D20 按意图值：val==CC_ON 记 0 踩沿、val==CC_OFF 记 1 抬沿
+  val == CC_ON ? diag_log(0, ch, val)                 // D20 type0 踩沿（按意图值，D24；去重吞发不影响意图记录）
+  : val == CC_OFF ? diag_log(1, ch, val)              // D20 type1 抬沿（按意图值）
+  : 0;                                                // 出口约定仅 0/127 两值
 );
 
 // 合成重同步出口（D25）：独立实现、不经 io_send_cc_raw；
@@ -170,6 +215,7 @@ function io_send_synth(off, ev_ch) local(io_eff, io_tgt, io_i) (
   io_tgt = ev_ch < 0 ? 0 : ev_ch;                     // D17 fallback 索引 0
   io_eff != g_mem[g_out_last + (io_tgt|0)] ? (
     midisend(off, 0xB0 | io_tgt, cfg_cc, io_eff);     // io_tgt 恒整（位运算结果或 fallback 0）
+    cc_sent_total = cc_sent_total + 1;                // M5 实发计数：仅实际 midisend 递增（T3）
   ) : 0;
   g_mem[g_out_last + (io_tgt|0)] = io_eff;
   io_i = 0;
@@ -177,12 +223,13 @@ function io_send_synth(off, ev_ch) local(io_eff, io_tgt, io_i) (
     g_mem[g_ch_auto + (io_i|0)] != 0 && io_i != io_tgt ? (
       io_eff != g_mem[g_out_last + (io_i|0)] ? (
         midisend(off, 0xB0 | io_i, cfg_cc, io_eff);   // io_i 循环计数恒整
+        cc_sent_total = cc_sent_total + 1;            // M5 实发计数：仅实际 midisend 递增（T3）
       ) : 0;
       g_mem[g_out_last + (io_i|0)] = io_eff;
     ) : 0;
     io_i = io_i + 1;
   );
-  // T3: diag_log 6 ch val —— 合成重同步
+  diag_log(6, io_tgt, io_eff);                        // D20 type6 合成重同步（a=事件目标/fallback 通道，b=合成值）
 );
 
 /* === M4 踏板调度（单槽调度器，plan §3.2.16 / 审核 P6c；物理顺序叶子在前）=== */
@@ -199,7 +246,7 @@ function ped_jitter(note) local(ped_lfsr, ped_fb, ped_k) (
     ped_lfsr = (ped_lfsr >> 1) | (ped_fb << 15);      // 16 位 Fibonacci LFSR（taps 16/14/13/11）
     ped_k = ped_k + 1;
   );
-  (((ped_lfsr & 0xFFFF) - 32768) / 32768) * 2 * srate * 0.001;   // 映射 [-2ms, +2ms) 采样数
+  (((ped_lfsr & 0xFFFF) - 32768) / 32768) * 2 * srate * 0.001;   // 映射 -2ms ~ +2ms 采样数
 );
 
 // 普通踩下入槽（plan §3.2.16③）：槽 = {active, down_at = t_abs + max(hum+jitter, 0), ch, kind 0}；
@@ -208,7 +255,7 @@ function ped_press(t_abs, ch, note) (
   ped_active = 1;
   ped_down_at = t_abs + max(cfg_hum_smp + ped_jitter(note), 0);   // D12 钳制
   ped_ch = ch;
-  ped_kind = 0;
+  ped_kind = 0;                                       // kind0=普通踩下（D18）；kind 的读取者 = diag_log type2 之 b 千位编码（N-5）；本路径沿事件由 type0 记录
 );
 
 // 换踏（plan §3.2.8；前置：槽 IDLE 且 st_auto_cc==127，D2/D15 由调用方保证——槽在途时①吸收，永不覆盖旧踩沿）：
@@ -235,11 +282,11 @@ function ped_rep(t_abs, ch, note, kind) local(ped_bs, ped_off, ped_any, ped_i) (
   kind == 1 ? ( win_bass_end = t_abs + cfg_win_bass_smp; )
   : kind == 2 ? ( win_rep_end = t_abs + cfg_win_rep_smp; )
   : 0;                                                // kind 3：不开窗
-  // T3: diag_log 2 ch note —— 换踏（含 kind 3 按钮路径，X9）
+  diag_log(2, ch, note + kind*1000);                  // D20 type2 换踏（含 kind3 按钮路径，X9）；b=note+kind*1000（kind∈1..3，note<1000 无歧义，N-5）
 );
 
 // 单槽出队仲裁（D16 / plan §3.2.16⑦）：A = 尾音 st_tail_end、B = 待踩沿 ped_down_at，按绝对时刻比较；
-// 过期 clamp 到 [block_start, block_start+n)（块首）；到期时刻 ≥ 块末（上界含等号，I-5）顺延下块；
+// 过期 clamp 到 block_start ~ block_start+n（块首）；到期时刻 ≥ 块末（上界含等号，I-5）顺延下块；
 // 平局尾音先：尾音先发 → 槽取消 → 在途踩沿一并取消，踏板保持抬起（plan §3.2.16⑦）。
 function ped_tick(block_start, n) local(ped_end, ped_a_due, ped_b_due, ped_a_off, ped_b_off, ped_any, ped_i) (
   ped_end = block_start + n;
@@ -292,7 +339,7 @@ function st_request_rep(t_abs, ch, note, kind) (
 function st_on_note_on(t_abs, ch, note) local(st_pc, st_is_bass, st_repeat, st_newbass) (
   slider16 == 1 ? (                                   // 挂起解除（下一次音符触发解除，plan §3.2.12）
     slider16 = 0;                                     // 直写 slider16（D1 音频直写例外）
-    // T3: diag_log 5 ch val —— 挂起翻转（此分支恒为实际翻转）
+    diag_log(5, ch, 0);                               // D20 type5 挂起翻转（1→0 恒为实际翻转；b=翻转后新值）
   ) : 0;
   st_pc = note % 12;
   st_is_bass = note <= cfg_bass_ceil;                 // 低音区（≤ 上限）= 换踏触发者（plan §3.2.5）
@@ -360,7 +407,7 @@ function st_reset(reason, t_abs) local(st_i, st_any) (
     st_any == 0 ? ( io_send_cc_raw(0, 0, CC_OFF); ) : 0;   // 空 → 索引 0（D4/D17）
   ) : 0;
   reason == 2 ? ( st_tail_end = t_abs + cfg_tail_smp; ) : 0;   // D21 自愈兜底（CC123 清表后尾音计时启动）
-  // T3: diag_log 4 reason t_abs —— 复位
+  diag_log(4, reason, t_abs);                         // D20 type4 复位（a=reason 1关沿/2 CC120·123；b=事件绝对时刻，浮点原样不取整）
 );
 
 /* === M2 MIDI I/O · 命令槽与 @block 主循环（cmd_* / io_dispatch / io_process_block）=== */
@@ -372,7 +419,7 @@ function cmd_tap() local(cmd_bs, cmd_ch, cmd_i) (
   cmd_bs = st_abs_smp - samplesblock;                 // 当前块首（§2.1）
   slider16 == 1 ? (
     slider16 = 0;                                     // 解除挂起（任何情况，plan §3.2.11；直写 slider16）
-    // T3: diag_log 5 ch val —— 挂起翻转（此分支恒为实际翻转）
+    diag_log(5, -1, 0);                               // D20 type5 挂起翻转（1→0 恒为实际翻转；命令槽无关联通道，a=-1 哨兵）
   ) : 0;
   ped_active != 0 ? 0                                 // 在途被吸收、不排队（N-8）
   : (
@@ -409,8 +456,8 @@ function cmd_release() local(cmd_i, cmd_any) (
     cmd_any == 0 ? ( io_send_cc_raw(0, 0, CC_OFF); ) : 0;   // 空 → 索引 0（D4/D17）
   ) : 0;
   st_tail_end = -1;
+  slider16 == 0 ? diag_log(5, -1, 1) : 0;             // D20 type5 仅实际翻转 0→1 时记录（a=-1 哨兵：命令槽无关联通道）
   slider16 = 1;                                       // 进入释放挂起（C04_HoldOff 电平住 slider，直写）
-  // T3: diag_log 5 ch val —— 挂起翻转（仅原值 0→1 实际翻转时记录）
 );
 
 // C03 恢复默认（D13 / plan §3.2.13）：仅复位参数，不动状态机/挂起标志/调度器；undo 点由 @gfx 调用方 sliderchange(-1) 产生。
@@ -441,7 +488,7 @@ function io_dispatch(off, msg1, msg2, msg3) local(io_ch, io_st, io_t_abs, io_sco
   ) : io_st == 0xB0 ? (
     msg2 == cfg_cc ? (
       st_hw_cc = msg3;                                // 硬件真值（plan §3.2.7）
-      // T3: diag_log 3 ch val —— 硬件 CC（启用态拦截）
+      diag_log(3, io_ch, msg3);                       // D20 type3 硬件 CC（启用态拦截分支）
       io_send_synth(off, io_ch);                      // 拦截合成单流、不直通（plan §3.1 B1）
     ) : (msg2 == 120 || msg2 == 123) ? (
       st_reset(2, io_t_abs);                          // 防卡死：与总开关软复位同待遇（plan §3.2.15/N3）
@@ -454,7 +501,7 @@ function io_dispatch(off, msg1, msg2, msg3) local(io_ch, io_st, io_t_abs, io_sco
   );
 );
 
-// @block 全序列（SDS §2.4）：哨兵引导 → 时基 → 开关沿+重同步 → D14 关态门控 → 命令槽 → midirecv → ped_tick → 收尾。
+// @block 全序列（SDS §2.4）：哨兵引导 → 时基 → 开关沿+重同步 → D14 关态门控 → 命令槽 → midirecv → ped_tick → 收尾+diag 快照。
 function io_process_block() local(bs, i, off, m1, m2, m3) (
   // ---- 步0 哨兵引导（D7 v1.3：st_booted 运行态门控，对 @init / @serialize 任何次序稳健）----
   st_booted == 0 ? (
@@ -500,11 +547,11 @@ function io_process_block() local(bs, i, off, m1, m2, m3) (
     while (midirecv(off, m1, m2, m3)) (
       (m1 & 0xF0) == 0xB0 && m2 == cfg_cc && (cfg_ch_scope == 0 || (m1 & 0x0F) == cfg_ch_scope - 1) ? (
         st_hw_cc = m3;
-        // T3: diag_log 3 ch val —— 硬件 CC（关态跟踪）
+        diag_log(3, m1 & 0x0F, m3);                   // D20 type3 硬件 CC（关态跟踪分支，D14）
       ) : 0;
       midisend(off, m1, m2, m3);                      // 原样直通（含目标 CC）
     );
-    // T3: diag_snapshot
+    diag_snapshot();                                  // 步3 收尾快照（关态亦记，§2.4）
     st_prev_enabled = 0;                              // X4：关态收尾同步
   ) : (
     // ---- 步4 命令槽消费（D19 独立上升沿；t_abs = block_start，D17；消费后清零，plan P7）----
@@ -527,11 +574,11 @@ function io_process_block() local(bs, i, off, m1, m2, m3) (
     st_prev_enabled = cfg_enabled;
 
     // ---- 步8 诊断快照 ----
-    // T3: diag_snapshot
+    diag_snapshot();                                  // §2.5：三真值/held/bass_pc[12]/实发计数 → 固定槽
   );
 );
 
-/* === M5 诊断 ===（T3 填充：diag_log / diag_snapshot 实现 + 基址登记 + 将上方 T3 占位注释替换为真实调用） */
+/* === M5 诊断 ===（已实现于 @init 前部 M5 节：diag_log / diag_snapshot 须先于最早调用方 io_send_cc_raw 定义，EEL2 先声明后调用） */
 /* === M6 UI ===（T4/T5 填充：ui_draw / ui_widget_* / ui_page_* / ui_draw_text / ui_draw_pedal） */
 
 st_resync_pending = 1;   // D7: 每次播放启动强制首块重同步（plan §4.1/§7.16）
@@ -539,8 +586,8 @@ st_resync_pending = 1;   // D7: 每次播放启动强制首块重同步（plan �
 cfg_sync_from_sliders();   // D23：@init 末尾无条件同步（只读 slider；采样率变化由 @slider 双保险）
 
 @serialize
-// D7 v1.3：非空占位——仅此一条赋值，不持久化任何变量（用户参数由 slider 自动保存承担；
-// 非空 @serialize 阻止变量清零 → 运行态跨播放启动保留，运行态哨兵由 T2 在 @block 首块安装）
+// D7 v1.3：非空占位——仅此一条赋值，不持久化任何变量（用户参数由 slider 自动保存承担）；
+// 非空 @serialize 阻止变量清零；跨播放启动存续；工程重载=全零+首块哨兵（见 @block 步0）
 st_serialize_marker = 1;
 
 @slider
@@ -548,7 +595,7 @@ st_serialize_marker = 1;
 cfg_sync_from_sliders();
 
 @block
-io_process_block();   // §2.4 全序列：哨兵引导 / 时基 / 沿检测+重同步 / 关态门控 / 命令槽 / midirecv / ped_tick / 收尾（diag 快照为 T3 占位）
+io_process_block();   // §2.4 全序列：哨兵引导 / 时基 / 沿检测+重同步 / 关态门控 / 命令槽 / midirecv / ped_tick / 收尾+diag 快照
 
 @gfx
 // T4: ui_draw ——（四页全定制 UI；本任务不接线）
