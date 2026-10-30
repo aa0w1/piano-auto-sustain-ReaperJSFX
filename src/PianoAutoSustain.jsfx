@@ -1,5 +1,5 @@
-/* Piano Auto Sustain — JSFX 实现，分节标记：M1 参数管线 / M2 MIDI I/O / M3 状态机 / M4 踏板调度 / M5 诊断 / M6 UI（后续任务填充）
-   依据：sds.md v1.3（D1–D25）+ plan.md v0.5；当前进度 T1：骨架 + 参数管线 + 基址表。 */
+// Piano Auto Sustain — JSFX 实现，分节标记：M1 参数管线 / M2 MIDI I/O / M3 状态机 / M4 踏板调度 / M5 诊断 / M6 UI（M5 归 T3、M6 归 T4/T5）
+// 依据：sds.md v1.3（D1–D25）+ plan.md v0.5；当前进度 T2：骨架 + 参数管线 + 基址表（T1）+ 引擎 M2/M3/M4 与 @block 接线（T2，diag 调用点以 T3 占位注释预留）。
 
 desc:Piano Auto Sustain (MIDI)
 in_pin:none
@@ -97,6 +97,7 @@ function cfg_sync_from_sliders() (
 );
 
 // 程序化写参（EEL2 无 slider[idx] 间接寻址 → if 链直写；D13：写值 + slider_automate + 同步）。
+// 契约（T2 挂账落实）：idx = slider 编号 1..12；slider12 传枚举索引 0/1/2（非 CC 号）；越界静默忽略。
 // 注意：函数体含 slider 写入，但仅在 T2 命令槽 / T4 UI 调用时执行；@init 执行路径不写 slider。
 function cfg_set_param(idx, val) (
   idx == 1  ? (slider1 = val; slider_automate(slider1))
@@ -132,11 +133,408 @@ function cfg_restore_defaults() (
   cfg_sync_from_sliders();
 );
 
-/* === M2 MIDI I/O ===（T2 填充：io_process_block / io_dispatch / io_send_synth / io_send_cc_raw / cmd_*） */
-/* === M3 状态机 ===（T2 填充：st_on_note_on / st_on_note_off / st_request_rep / st_reset） */
-/* === M4 踏板调度 ===（T2 填充：ped_rep / ped_press / ped_tick / ped_jitter / win_lookup） */
-/* === M5 诊断 ===（T3 填充：diag_log / diag_snapshot） */
+/* ---- T2 运行态标量登记（EEL2 未定义变量静默为 0，逐一登记；全部非持久化，D7 v1.3）----
+ *   门控/时基：st_booted（@block 首块门控）  st_resync_pending（@init 置 1）  st_abs_smp  st_prev_enabled
+ *   状态机：st_held_total  st_last_note  st_tail_end  st_evt_seq  st_hw_cc  st_auto_cc
+ *   单槽调度器：ped_active  ped_down_at  ped_ch  ped_kind
+ *   限流窗止（绝对时刻）：win_bass_end  win_rep_end
+ * 数组寻址：一律 g_mem[基址常量 + 下标]（T1 基址登记表），严禁 st_/ped_ 前缀名直接下标；
+ *   变量下标按 P11 以 (x|0) 取整，时间戳与块内偏移按 D10 保持浮点、一律不加 |0；
+ *   局部暂存一律函数 local() 声明（跨函数互不可见；跨函数共享数据只走 g_mem 数组，N10）。
+ */
+
+/* === M2 MIDI I/O · 出口原语（叶子先行）===
+ * io_send_cc_raw 与 io_send_synth 仅依赖 midisend，是全插件的叶子函数；
+ * 因 ped_/st_/cmd_ 各函数都调用它们，EEL2 先声明后调用 → 物理位置必须最前
+ * （SDS §2.4 的依赖序压倒任务单「ped_→st_→cmd_→io_」的模块列举序，T2 汇报记录此偏离）。
+ */
+
+// 自动沿唯一出口（D24）：出口内合并硬件 out = max(val, st_hw_cc)，按通道去重后 midisend（合成单流，plan §3.1 B1）；
+// 记 st_auto_cc = 意图值、并把 st_ch_auto 该通道标志置 1；diag 按意图值记（T3 接线）。
+function io_send_cc_raw(off, ch, val) local(io_out) (
+  io_out = max(val, st_hw_cc);                        // D24 出口合成：硬件踩住时自动抬沿不切延音
+  io_out != g_mem[g_out_last + (ch|0)] ? (
+    midisend(off, 0xB0 | ch, cfg_cc, io_out);         // 去重守卫（I-3）：与该通道上次输出相同则不重发（ch 由位运算得来，恒整）
+  ) : 0;
+  g_mem[g_out_last + (ch|0)] = io_out;                // 恒写（等值时为无害重写）
+  st_auto_cc = val;                                   // D24：意图态 0/127
+  g_mem[g_ch_auto + (ch|0)] = 1;                      // D4：登记「该通道发过自动 CC」
+  // T3: diag_log 0/1 ch val —— D20 按意图值：val==CC_ON 记 0 踩沿、val==CC_OFF 记 1 抬沿
+);
+
+// 合成重同步出口（D25）：独立实现、不经 io_send_cc_raw；
+// 目标 = st_ch_auto 全部 ∪ 事件通道（事件通道缺失时 fallback 索引 0，D4/D17）；
+// 逐通道 eff = max(st_hw_cc, st_auto_cc) 发合成流并按通道写 st_out_last；不触 st_auto_cc / st_ch_auto。
+function io_send_synth(off, ev_ch) local(io_eff, io_tgt, io_i) (
+  io_eff = max(st_hw_cc, st_auto_cc);
+  io_tgt = ev_ch < 0 ? 0 : ev_ch;                     // D17 fallback 索引 0
+  io_eff != g_mem[g_out_last + (io_tgt|0)] ? (
+    midisend(off, 0xB0 | io_tgt, cfg_cc, io_eff);     // io_tgt 恒整（位运算结果或 fallback 0）
+  ) : 0;
+  g_mem[g_out_last + (io_tgt|0)] = io_eff;
+  io_i = 0;
+  while (io_i < 16) (                                 // 目标集其余成员 = st_ch_auto 全部（D8 先置 -1 破守卫以强制重发）
+    g_mem[g_ch_auto + (io_i|0)] != 0 && io_i != io_tgt ? (
+      io_eff != g_mem[g_out_last + (io_i|0)] ? (
+        midisend(off, 0xB0 | io_i, cfg_cc, io_eff);   // io_i 循环计数恒整
+      ) : 0;
+      g_mem[g_out_last + (io_i|0)] = io_eff;
+    ) : 0;
+    io_i = io_i + 1;
+  );
+  // T3: diag_log 6 ch val —— 合成重同步
+);
+
+/* === M4 踏板调度（单槽调度器，plan §3.2.16 / 审核 P6c；物理顺序叶子在前）=== */
+
+// 下踏人性化抖动（plan §3.2.10 / P8）：LFSR 种子 = 音符 + 事件序号（与音频块划分无关，跨设备/缓冲配置结果一致），
+// 每次生成事件 st_evt_seq 自增（X11）；返回 ±2ms 对应的采样数（时间戳语境，浮点，不加 |0）。
+function ped_jitter(note) local(ped_lfsr, ped_fb, ped_k) (
+  ped_lfsr = (note + st_evt_seq) & 0xFFFF;            // 位运算自动取整 → 16 位种子
+  st_evt_seq = st_evt_seq + 1;                        // 每次生成事件序号自增（X11）
+  ped_lfsr == 0 ? ( ped_lfsr = 0xACE1; ) : 0;         // LFSR 防全零锁死（经典 16 位种子）
+  ped_k = 0;
+  while (ped_k < 8) (                                 // 推进 8 拍去相关（确定性，步数固定）
+    ped_fb = (ped_lfsr & 1) ^ ((ped_lfsr >> 2) & 1) ^ ((ped_lfsr >> 3) & 1) ^ ((ped_lfsr >> 5) & 1);
+    ped_lfsr = (ped_lfsr >> 1) | (ped_fb << 15);      // 16 位 Fibonacci LFSR（taps 16/14/13/11）
+    ped_k = ped_k + 1;
+  );
+  (((ped_lfsr & 0xFFFF) - 32768) / 32768) * 2 * srate * 0.001;   // 映射 [-2ms, +2ms) 采样数
+);
+
+// 普通踩下入槽（plan §3.2.16③）：槽 = {active, down_at = t_abs + max(hum+jitter, 0), ch, kind 0}；
+// 前置：槽 IDLE（调用方独占链①保证）；在途吸收由独占链①承担，此处永不覆盖旧踩沿。
+function ped_press(t_abs, ch, note) (
+  ped_active = 1;
+  ped_down_at = t_abs + max(cfg_hum_smp + ped_jitter(note), 0);   // D12 钳制
+  ped_ch = ch;
+  ped_kind = 0;
+);
+
+// 换踏（plan §3.2.8；前置：槽 IDLE 且 st_auto_cc==127，D2/D15 由调用方保证——槽在途时①吸收，永不覆盖旧踩沿）：
+// ① 立即抬沿：对 st_ch_auto（空→索引 0）逐通道 io_send_cc_raw（抬沿不受人性化，plan §3.2.8）；
+// ② 踩沿入槽（D12：down_at = t_abs + gap + max(hum+jitter, 0)，保证沿序 ≥ 抬沿 + gap，P6b）；
+// ③ kind 1 开低音限流窗、kind 2 开重复音限流窗、kind 3 按钮不开窗（D18 / plan §3.2.11）。
+function ped_rep(t_abs, ch, note, kind) local(ped_bs, ped_off, ped_any, ped_i) (
+  ped_bs = st_abs_smp - samplesblock;                 // 当前块首（§2.1）
+  ped_off = t_abs - ped_bs;                           // 抬沿块内偏移（t_abs 恒在本块内）
+  ped_any = 0;
+  ped_i = 0;
+  while (ped_i < 16) (
+    g_mem[g_ch_auto + (ped_i|0)] != 0 ? (
+      io_send_cc_raw(ped_off, ped_i, CC_OFF);         // 抬沿逐通道（D4）
+      ped_any = 1;
+    ) : 0;
+    ped_i = ped_i + 1;
+  );
+  ped_any == 0 ? ( io_send_cc_raw(ped_off, 0, CC_OFF); ) : 0;   // D4：目标空 → fallback 索引 0
+  ped_active = 1;                                     // 踩沿入槽
+  ped_down_at = t_abs + cfg_gap_smp + max(cfg_hum_smp + ped_jitter(note), 0);   // D12
+  ped_ch = ch;
+  ped_kind = kind;
+  kind == 1 ? ( win_bass_end = t_abs + cfg_win_bass_smp; )
+  : kind == 2 ? ( win_rep_end = t_abs + cfg_win_rep_smp; )
+  : 0;                                                // kind 3：不开窗
+  // T3: diag_log 2 ch note —— 换踏（含 kind 3 按钮路径，X9）
+);
+
+// 单槽出队仲裁（D16 / plan §3.2.16⑦）：A = 尾音 st_tail_end、B = 待踩沿 ped_down_at，按绝对时刻比较；
+// 过期 clamp 到 [block_start, block_start+n)（块首）；到期时刻 ≥ 块末（上界含等号，I-5）顺延下块；
+// 平局尾音先：尾音先发 → 槽取消 → 在途踩沿一并取消，踏板保持抬起（plan §3.2.16⑦）。
+function ped_tick(block_start, n) local(ped_end, ped_a_due, ped_b_due, ped_a_off, ped_b_off, ped_any, ped_i) (
+  ped_end = block_start + n;
+  ped_a_due = st_tail_end >= 0 && st_tail_end < ped_end;      // 含过期（< 块首亦视为到期，下方 clamp）
+  ped_b_due = ped_active != 0 && ped_down_at < ped_end;       // ≥ 块末顺延（上界含等号）
+  ped_a_due != 0 && (ped_b_due == 0 || ped_down_at >= st_tail_end) ? (
+    // 尾音先（含平局）
+    ped_a_off = st_tail_end - block_start;
+    ped_a_off < 0 ? ( ped_a_off = 0; ) : 0;           // 过期 clamp
+    ped_active = 0;                                   // 槽取消（在途踩沿一并取消）
+    ped_any = 0;
+    ped_i = 0;
+    while (ped_i < 16) (
+      g_mem[g_ch_auto + (ped_i|0)] != 0 ? (
+        io_send_cc_raw(ped_a_off, ped_i, CC_OFF);     // 释放沿逐通道（无人性化）
+        ped_any = 1;
+      ) : 0;
+      ped_i = ped_i + 1;
+    );
+    ped_any == 0 ? ( io_send_cc_raw(ped_a_off, 0, CC_OFF); ) : 0;   // 空 → 索引 0
+    st_tail_end = -1;
+  ) : ped_b_due != 0 ? (
+    // 踩沿先：落地 CC_ON，槽回 IDLE（尾音若同块稍后到期 → 下块 clamp 补发，≤1 块偏差）
+    ped_b_off = ped_down_at - block_start;
+    ped_b_off < 0 ? ( ped_b_off = 0; ) : 0;           // 过期 clamp
+    io_send_cc_raw(ped_b_off, ped_ch, CC_ON);
+    ped_active = 0;                                   // 槽 IDLE
+  ) : 0;
+);
+
+// 限流窗查询（D18）：kind 1 → 低音窗、2 → 重复音窗、3 → 无窗（返回 -1 表示不开窗）；返回窗止绝对时刻。
+function win_lookup(kind) (
+  kind == 1 ? win_bass_end : kind == 2 ? win_rep_end : -1;
+);
+
+/* === M3 状态机（按住表 / 低音 pc 集合 / 重复音 / 新音级 / 挂起 / 独占链 / 软复位；
+     定义顺序满足先声明后调用：st_request_rep → st_on_note_on → st_on_note_off → st_reset）=== */
+
+// 限流窗闸（SDS §2.4 / plan §3.2.16）：事件时刻在对应窗内 → 吸收（落选者不开窗，N5）；否则转 ped_rep。
+function st_request_rep(t_abs, ch, note, kind) (
+  t_abs < win_lookup(kind) ? (
+    0                                                 // 窗内吸收
+  ) : (
+    ped_rep(t_abs, ch, note, kind);
+  );
+);
+
+// 音符触发（D22 三参）：挂起解除 → 旧值判定 repeat / new_bass_pc → 计数更新 → 尾音取消 →
+// 独占链（D2 一次仲裁、互斥；②③带 D15 st_auto_cc==127 闸；同块双命中按重复音优先，N-3）。
+function st_on_note_on(t_abs, ch, note) local(st_pc, st_is_bass, st_repeat, st_newbass) (
+  slider16 == 1 ? (                                   // 挂起解除（下一次音符触发解除，plan §3.2.12）
+    slider16 = 0;                                     // 直写 slider16（D1 音频直写例外）
+    // T3: diag_log 5 ch val —— 挂起翻转（此分支恒为实际翻转）
+  ) : 0;
+  st_pc = note % 12;
+  st_is_bass = note <= cfg_bass_ceil;                 // 低音区（≤ 上限）= 换踏触发者（plan §3.2.5）
+  st_repeat = note == st_last_note;                   // 重复音（任意音区，plan §3.2.9）
+  st_newbass = st_is_bass != 0 && (cfg_ign_oct != 0
+    ? g_mem[g_bass_pc + (st_pc|0)] == 0
+    : (g_mem[g_bass_pc + (st_pc|0)] == 0 || g_mem[g_note_cnt + (note|0)] == 0));   // plan §3.2.4
+  st_last_note = note;                                // 计数更新（判定用旧值，故先判后更）
+  g_mem[g_note_cnt + (note|0)] = g_mem[g_note_cnt + (note|0)] + 1;
+  st_held_total = st_held_total + 1;
+  st_is_bass != 0 ? ( g_mem[g_bass_pc + (st_pc|0)] = g_mem[g_bass_pc + (st_pc|0)] + 1; ) : 0;
+  st_tail_end = -1;                                   // 期间新音取消尾音计时（plan §3.2.6）
+  ped_active != 0 ? 0                                 // ① 槽在途（含 gap/待踩沿）：全部吸收（plan §3.2.16①，N4/N8）
+  : (cfg_chord != 0 && cfg_repeat_repedal != 0 && st_repeat != 0 && st_auto_cc == 127) ? (
+    st_request_rep(t_abs, ch, note, 2);               // ② 重复音重踏（同命中优先，N-3；D15 闸）
+  ) : (cfg_chord != 0 && st_newbass != 0 && st_auto_cc == 127) ? (
+    st_request_rep(t_abs, ch, note, 1);               // ③ 低音新音级换踏（D15 闸；上限以上只踩不换，plan §3.2.2）
+  ) : st_auto_cc == 0 ? (
+    ped_press(t_abs, ch, note);                       // ④ 普通踩下（plan §3.2.1；自动侧已下则无动作）
+  ) : 0;
+);
+
+// 音符释放（D22 三参 / plan §3.2.6）：note_cnt > 0 才递减（bass_pc 递减下限 0，X11）；
+// 全部松开且未挂起 → 尾音计时（挂起期间尾音计时挂起，plan §3.2.12）；释放沿不受人性化。
+function st_on_note_off(t_abs, ch, note) local(st_pc) (
+  g_mem[g_note_cnt + (note|0)] > 0 ? (
+    g_mem[g_note_cnt + (note|0)] = g_mem[g_note_cnt + (note|0)] - 1;
+    st_held_total = st_held_total - 1;
+    st_pc = note % 12;
+    note <= cfg_bass_ceil ? (
+      g_mem[g_bass_pc + (st_pc|0)] = max(g_mem[g_bass_pc + (st_pc|0)] - 1, 0);   // X11 下限 0
+    ) : 0;
+  ) : 0;
+  st_held_total == 0 && slider16 == 0 ? (
+    st_tail_end = t_abs + cfg_tail_smp;               // 释放沿即时刻、无人性化（plan §3.2.6）
+  ) : 0;
+);
+
+// 软复位（D21 v1.3.1 / plan §3.2.14 总开关、§3.2.15 CC120/123）：reason 1 = 关沿、2 = CC120/123。
+// 清槽 / 按住表 / 低音 pc / 两窗 / last_note / tail_end / 直写 slider16 = 0（挂起解除）；
+// st_auto_cc==127 → 对 st_ch_auto（空→索引 0）逐通道立即发 io_send_cc_raw 之 off=0、val=CC_OFF
+// （D24 出口合并保证硬件踩住时输出保持硬件值）；reason==2 → 尾音自愈兜底（去重守卫抑制重复发送）。
+function st_reset(reason, t_abs) local(st_i, st_any) (
+  ped_active = 0;                                     // 槽回 IDLE（在途待踩沿取消，plan §3.2.16⑤/N9）
+  st_i = 0;
+  while (st_i < 128) ( g_mem[g_note_cnt + (st_i|0)] = 0; st_i = st_i + 1; );   // 按住表清空
+  st_held_total = 0;
+  st_i = 0;
+  while (st_i < 12) ( g_mem[g_bass_pc + (st_i|0)] = 0; st_i = st_i + 1; );     // 低音和声集合清空
+  win_bass_end = -1;                                  // 两窗清（plan §3.2.16⑤）
+  win_rep_end = -1;
+  st_last_note = -1;
+  st_tail_end = -1;
+  slider16 = 0;                                       // 挂起解除（直写 slider16，D21）
+  st_auto_cc == 127 ? (                               // 先判后放（io_send_cc_raw 会改写 st_auto_cc）
+    st_any = 0;
+    st_i = 0;
+    while (st_i < 16) (
+      g_mem[g_ch_auto + (st_i|0)] != 0 ? (
+        io_send_cc_raw(0, st_i, CC_OFF);              // 立即释放（plan §3.2.15；偏移 0 = 块首）
+        st_any = 1;
+      ) : 0;
+      st_i = st_i + 1;
+    );
+    st_any == 0 ? ( io_send_cc_raw(0, 0, CC_OFF); ) : 0;   // 空 → 索引 0（D4/D17）
+  ) : 0;
+  reason == 2 ? ( st_tail_end = t_abs + cfg_tail_smp; ) : 0;   // D21 自愈兜底（CC123 清表后尾音计时启动）
+  // T3: diag_log 4 reason t_abs —— 复位
+);
+
+/* === M2 MIDI I/O · 命令槽与 @block 主循环（cmd_* / io_dispatch / io_process_block）=== */
+
+// C01 换踏一次（plan §3.2.11）：任何情况解除挂起；在途（gap/待踩沿）吸收、不排队（N-8）；
+// 自动侧在下（st_auto_cc==127）→ 按钮换踏（kind 3：不受限流窗、不重开窗，D18/D20 X9）；否则仅踩下；
+// 完成后无按住音符 → 尾音计时启动（plan §3.2.16⑥）。无事件调度点 t_abs = block_start（D17）。
+function cmd_tap() local(cmd_bs, cmd_ch, cmd_i) (
+  cmd_bs = st_abs_smp - samplesblock;                 // 当前块首（§2.1）
+  slider16 == 1 ? (
+    slider16 = 0;                                     // 解除挂起（任何情况，plan §3.2.11；直写 slider16）
+    // T3: diag_log 5 ch val —— 挂起翻转（此分支恒为实际翻转）
+  ) : 0;
+  ped_active != 0 ? 0                                 // 在途被吸收、不排队（N-8）
+  : (
+    cmd_ch = -1;
+    cmd_i = 0;
+    while (cmd_i < 16) (                              // ch_first = st_ch_auto 升序首个非零，否则 0（D17）
+      cmd_ch < 0 && g_mem[g_ch_auto + (cmd_i|0)] != 0 ? ( cmd_ch = cmd_i; ) : 0;
+      cmd_i = cmd_i + 1;
+    );
+    cmd_ch < 0 ? ( cmd_ch = 0; ) : 0;
+    st_auto_cc == 127 ? (
+      ped_rep(cmd_bs, cmd_ch, 0, 3);                  // 按钮换踏（kind 3 不开窗，D18）
+    ) : (
+      ped_press(cmd_bs, cmd_ch, 0);                   // 踏板在上：仅踩下（plan §3.2.11）
+    );
+    st_held_total == 0 ? ( st_tail_end = cmd_bs + cfg_tail_smp; ) : 0;   // plan §3.2.16⑥
+  );
+);
+
+// C02 释放踏板（plan §3.2.12）：槽取消；自动侧在下 → 对 st_ch_auto（空→索引 0）立即释放（D24 合并保护硬件）；
+// 尾音取消；进入释放挂起（直写 slider16=1；挂起期间自动踩下/换踏/尾音计时全部挂起）。
+function cmd_release() local(cmd_i, cmd_any) (
+  ped_active = 0;                                     // 槽取消（gap 中待踩沿取消，plan §3.2.12）
+  st_auto_cc == 127 ? (                               // 先判后放（io_send_cc_raw 会改写 st_auto_cc）
+    cmd_any = 0;
+    cmd_i = 0;
+    while (cmd_i < 16) (
+      g_mem[g_ch_auto + (cmd_i|0)] != 0 ? (
+        io_send_cc_raw(0, cmd_i, CC_OFF);             // 自动侧立即释放（偏移 0 = 块首）
+        cmd_any = 1;
+      ) : 0;
+      cmd_i = cmd_i + 1;
+    );
+    cmd_any == 0 ? ( io_send_cc_raw(0, 0, CC_OFF); ) : 0;   // 空 → 索引 0（D4/D17）
+  ) : 0;
+  st_tail_end = -1;
+  slider16 = 1;                                       // 进入释放挂起（C04_HoldOff 电平住 slider，直写）
+  // T3: diag_log 5 ch val —— 挂起翻转（仅原值 0→1 实际翻转时记录）
+);
+
+// C03 恢复默认（D13 / plan §3.2.13）：仅复位参数，不动状态机/挂起标志/调度器；undo 点由 @gfx 调用方 sliderchange(-1) 产生。
+function cmd_restore() (
+  cfg_restore_defaults();
+);
+
+// MIDI 分类（SDS §2.4 / plan §3.1）：作用域外全部原样直通（§3.1 直通原则；通道作用域同时限定状态机输入，
+// plan §3.1「多音色 item 应设通道作用域」）；0x9X vel0 归一为 Note Off（plan §3.1）；
+// 0xBX 目标 CC → 拦截、只出合成流（plan §3.1 B1）；CC120/123 → 软复位 + 消息直通（plan §3.2.15/N3）；其余直通。
+function io_dispatch(off, msg1, msg2, msg3) local(io_ch, io_st, io_t_abs, io_scope) (
+  io_ch = msg1 & 0x0F;
+  io_st = msg1 & 0xF0;
+  io_t_abs = (st_abs_smp - samplesblock) + off;       // §2.1：事件绝对时刻
+  io_scope = cfg_ch_scope == 0 || io_ch == cfg_ch_scope - 1;   // scope==0 全部 / 1-16 单通道
+  io_scope == 0 ? (
+    midisend(off, msg1, msg2, msg3);                  // 作用域外：原样直通
+  ) : io_st == 0x90 ? (
+    msg3 > 0 ? (
+      st_on_note_on(io_t_abs, io_ch, msg2);           // D22 三参
+    ) : (
+      st_on_note_off(io_t_abs, io_ch, msg2);          // vel0 归一为 Note Off（plan §3.1）
+    );
+    midisend(off, msg1, msg2, msg3);                  // 直通
+  ) : io_st == 0x80 ? (
+    st_on_note_off(io_t_abs, io_ch, msg2);
+    midisend(off, msg1, msg2, msg3);                  // 直通
+  ) : io_st == 0xB0 ? (
+    msg2 == cfg_cc ? (
+      st_hw_cc = msg3;                                // 硬件真值（plan §3.2.7）
+      // T3: diag_log 3 ch val —— 硬件 CC（启用态拦截）
+      io_send_synth(off, io_ch);                      // 拦截合成单流、不直通（plan §3.1 B1）
+    ) : (msg2 == 120 || msg2 == 123) ? (
+      st_reset(2, io_t_abs);                          // 防卡死：与总开关软复位同待遇（plan §3.2.15/N3）
+      midisend(off, msg1, msg2, msg3);                // 消息本身仍直通
+    ) : (
+      midisend(off, msg1, msg2, msg3);                // 非目标 CC：原样直通
+    );
+  ) : (
+    midisend(off, msg1, msg2, msg3);                  // 其他消息直通（SysEx 已由 midirecv 原生直通，N-6）
+  );
+);
+
+// @block 全序列（SDS §2.4）：哨兵引导 → 时基 → 开关沿+重同步 → D14 关态门控 → 命令槽 → midirecv → ped_tick → 收尾。
+function io_process_block() local(bs, i, off, m1, m2, m3) (
+  // ---- 步0 哨兵引导（D7 v1.3：st_booted 运行态门控，对 @init / @serialize 任何次序稳健）----
+  st_booted == 0 ? (
+    st_last_note = -1;
+    st_tail_end = -1;
+    st_evt_seq = 0;
+    i = 0;
+    while (i < 16) ( g_mem[g_out_last + (i|0)] = -1; i = i + 1; );   // out_last[16] = -1（去重守卫初值）
+    st_hw_cc = 0;
+    st_auto_cc = 0;
+    ped_active = 0;
+    win_bass_end = -1;                                // 两窗
+    win_rep_end = -1;
+    i = 0;
+    while (i < 3) ( g_mem[g_slot_prev + (i|0)] = 0; i = i + 1; );    // 命令槽影子清零（D19）
+    i = 0;
+    while (i < 16) ( g_mem[g_ch_auto + (i|0)] = 0; i = i + 1; );     // ch_auto 清零
+    slider16 = 0;                                     // D7：重载首块直写清 0（挂起标志复位）
+    st_booted = 1;
+  ) : 0;
+
+  // ---- 步1 时基（§2.1：st_abs_smp 每块累加，block_start = 减回 samplesblock）----
+  st_abs_smp = st_abs_smp + samplesblock;
+  bs = st_abs_smp - samplesblock;
+
+  // ---- 步2 开关沿 + 重同步（D6/D8，X1 修复）----
+  cfg_enabled == 0 && st_prev_enabled != 0 ? (
+    st_reset(1, bs);                                  // 下降沿：软复位（D21 reason 1，无尾音自愈）
+  ) : 0;
+  cfg_enabled != 0 && st_prev_enabled == 0 ? (
+    st_resync_pending = 1;                            // 上升沿：置重同步
+  ) : 0;
+  st_resync_pending != 0 && cfg_enabled != 0 ? (
+    i = 0;
+    while (i < 16) ( g_mem[g_out_last + (i|0)] = -1; i = i + 1; );   // D8：全部置 -1 破去重守卫
+    io_send_synth(0, 0);                              // D17：无事件调度点 off=0；补发合成值（仅启用时）
+    st_resync_pending = 0;
+  ) : 0;
+
+  // ---- 步3 D14 关态门控 ----
+  cfg_enabled == 0 ? (
+    // 直通循环：目标 CC 仅跟踪 st_hw_cc（不拦截不合成，X2/I-2 修复幻象延音），其余完全直通（plan §3.2.14）
+    while (midirecv(off, m1, m2, m3)) (
+      (m1 & 0xF0) == 0xB0 && m2 == cfg_cc && (cfg_ch_scope == 0 || (m1 & 0x0F) == cfg_ch_scope - 1) ? (
+        st_hw_cc = m3;
+        // T3: diag_log 3 ch val —— 硬件 CC（关态跟踪）
+      ) : 0;
+      midisend(off, m1, m2, m3);                      // 原样直通（含目标 CC）
+    );
+    // T3: diag_snapshot
+    st_prev_enabled = 0;                              // X4：关态收尾同步
+  ) : (
+    // ---- 步4 命令槽消费（D19 独立上升沿；t_abs = block_start，D17；消费后清零，plan P7）----
+    g_mem[g_slot_prev + 0] == 0 && slider13 == 1 ? ( cmd_tap(); slider13 = 0; ) : 0;
+    g_mem[g_slot_prev + 1] == 0 && slider14 == 1 ? ( cmd_release(); slider14 = 0; ) : 0;
+    g_mem[g_slot_prev + 2] == 0 && slider15 == 1 ? ( cmd_restore(); slider15 = 0; ) : 0;
+    g_mem[g_slot_prev + 0] = slider13;                // 影子每块无条件同步（D19）
+    g_mem[g_slot_prev + 1] = slider14;
+    g_mem[g_slot_prev + 2] = slider15;
+
+    // ---- 步5 midirecv 循环 → io_dispatch（「取全发全」；SysEx 由 midirecv 原生直通，N-6）----
+    while (midirecv(off, m1, m2, m3)) (
+      io_dispatch(off, m1, m2, m3);
+    );
+
+    // ---- 步6 ped_tick（D16 仲裁：绝对时刻比较 / 过期 clamp / ≥块末顺延 / 平局尾音先）----
+    ped_tick(bs, samplesblock);
+
+    // ---- 步7 收尾（X4：每块末无条件同步开关沿影子）----
+    st_prev_enabled = cfg_enabled;
+
+    // ---- 步8 诊断快照 ----
+    // T3: diag_snapshot
+  );
+);
+
+/* === M5 诊断 ===（T3 填充：diag_log / diag_snapshot 实现 + 基址登记 + 将上方 T3 占位注释替换为真实调用） */
 /* === M6 UI ===（T4/T5 填充：ui_draw / ui_widget_* / ui_page_* / ui_draw_text / ui_draw_pedal） */
+
+st_resync_pending = 1;   // D7: 每次播放启动强制首块重同步（plan §4.1/§7.16）
 
 cfg_sync_from_sliders();   // D23：@init 末尾无条件同步（只读 slider；采样率变化由 @slider 双保险）
 
@@ -150,7 +548,7 @@ st_serialize_marker = 1;
 cfg_sync_from_sliders();
 
 @block
-// T2: io_process_block ——（哨兵引导 / 开关沿检测 / 关态门控直通 / 重同步补发 / 命令槽消费 / midirecv 分类 / ped_tick；本任务不接线）
+io_process_block();   // §2.4 全序列：哨兵引导 / 时基 / 沿检测+重同步 / 关态门控 / 命令槽 / midirecv / ped_tick / 收尾（diag 快照为 T3 占位）
 
 @gfx
 // T4: ui_draw ——（四页全定制 UI；本任务不接线）
