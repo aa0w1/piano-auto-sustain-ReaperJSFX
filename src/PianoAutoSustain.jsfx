@@ -1,5 +1,5 @@
 // Piano Auto Sustain — JSFX 实现，分节标记：M1 参数管线 / M2 MIDI I/O / M3 状态机 / M4 踏板调度 / M5 诊断 / M6 UI（M5 归 T3、M6 归 T4/T5）
-// 依据：sds.md v1.3（D1–D25）+ plan.md v0.5；当前进度 T3：T1 骨架/参数管线/基址表 + T2 引擎 M2/M3/M4 + T3 诊断 M5（环形/快照/实发计数，占位已替换为真实调用）。
+// 依据：sds.md v1.3（D1–D25）+ plan.md v0.5；当前进度 T4：T1 骨架/参数管线/基址表 + T2 引擎 M2/M3/M4 + T3 诊断 M5 + T4 UI 框架/演奏页（页签+命中+控件库+踏板动画；高级/诊断/说明书页为 T5 占位）。
 
 desc:Piano Auto Sustain (MIDI)
 in_pin:none
@@ -34,6 +34,63 @@ slider16:0<0,1,1>-C04_HoldOff
 // ---- 常量区（T4 在此追加 UI 颜色/布局常量）----
 CC_ON = 127;   // 自动侧踩下值
 CC_OFF = 0;    // 自动侧抬起值
+
+// ---- UI 主题/布局/字号常量（T4：集中一处；文本色 0xRRGGBB 走 gfx_set，图元色经 ui_set_rgb 换算 0..1）----
+UI_C_BG    = 0x14171C;   // 窗底 深灰蓝
+UI_C_CARD  = 0x1C2128;   // 卡片/页签底
+UI_C_BTN   = 0x242B34;   // 按钮底
+UI_C_BTN2  = 0x2E3641;   // 开关关态轨道
+UI_C_LINE  = 0x2A313B;   // 描边
+UI_C_ACC   = 0x5CC8FF;   // 冰蓝 accent
+UI_C_TXT   = 0xD8E2EC;   // 主文字
+UI_C_DIM   = 0x7E8894;   // 次文字
+UI_C_KNOB  = 0xE6EEF5;   // 开关旋钮
+UI_C_PLATE = 0x39434F;   // 踏板板面
+UI_C_PEDLN = 0x232A32;   // 踏板防滑纹
+UI_C_PEDSH = 0x000000;   // 踏板阴影（纯黑，透明度运行时定）
+
+UI_W0 = 380;  UI_H0 = 460;                     // 设计基准尺寸
+UI_M = 10;                                     // 页边距
+UI_LCOL_W = 120;  UI_GAP = 8;                  // 左列宽 / 间距
+UI_TAB_Y = 32;  UI_TAB_H = 24;  UI_TAB_G = 6;  // 页签栏
+UI_CARD_H = 108;                               // 参数卡高
+UI_BTN_H = 26;  UI_TGL_H = 26;                 // 按钮/开关行高
+UI_STP_W = 40;  UI_STP_H = 26;                 // 步进按钮尺寸
+UI_PED_W = 60;  UI_PED_H = 150;                // 踏板板面尺寸
+UI_FS_TITLE = 14;  UI_FS_SUB = 9;  UI_FS_LBL = 11;  UI_FS_TXT = 12;   // 字号
+UI_FS_SM = 10;  UI_FS_NUM = 20;  UI_FS_SYM = 14;
+UI_BC_STEP = 1;  UI_TAIL_STEP = 100;           // 步进量（页面调用与 ui_act_fire 同源）
+UI_SC_MIN = 0.75;                              // 缩放下限钳制（更小窗口允许裁切）
+
+// 页级 Y 锚（I4 常量化：设计值，落地 = ui_oy + 值×ui_sc；全表见 tests/T4坐标表.md）
+UI_Y_TITLE = 6;    UI_Y_SUB = 13;              // 标题/副题
+UI_Y_CARD1 = 64;   UI_Y_CARD2 = 180;           // 两大参数卡顶
+UI_Y_PED = 76;     UI_Y_PEDLBL = 232;          // 踏板板面顶/「自动踏板」说明
+UI_Y_PEDST = 246;  UI_Y_EN = 264;              // 踏板两态字/总开关
+UI_Y_TGLROW = 302; UI_Y_HINT = 338;            // 开关行/说明一行
+UI_Y_BTN = 398;    UI_Y_STATUS = 434;          // 底部按钮/状态行
+
+// UI 动作 id（= 命中槽 id，0..63；步进器占相邻双 id：−=id、+=id+1）
+UI_A_TAB0 = 0;  UI_A_TAB1 = 1;  UI_A_TAB2 = 2;  UI_A_TAB3 = 3;
+UI_A_EN = 4;
+UI_A_BC_M = 5;  UI_A_BC_P = 6;
+UI_A_TAIL_M = 7;  UI_A_TAIL_P = 8;
+UI_A_CHORD = 9;  UI_A_OCT = 10;
+UI_A_TAP = 11;  UI_A_REL = 12;  UI_A_RST = 13;
+
+// UI 文案（# 串槽 @init 赋值；绘制输出经 gfx_printf 每帧重新格式化）
+#str_title="Piano Auto Sustain";  #str_sub="自动延音 · 低音锚定换踏";
+#str_t0="演奏";  #str_t1="高级设置";  #str_t2="诊断";  #str_t3="说明书";
+#str_t5a="T5 —— 高级设置页由任务 5 实现";
+#str_t5b="T5 —— 诊断页由任务 5 实现";
+#str_t5c="T5 —— 说明书页由任务 5 实现";
+#str_pl="自动踏板";  #str_pd="踩下";  #str_pu="抬起";
+#str_en="启用自动踏板";
+#str_bc="低音识别上限";  #str_tl="松弛后的延音";
+#str_ch="和弦保护";  #str_oc="忽略八度变化";
+#str_hint="和弦保护：低音区新音级触发换踏；忽略八度：低音同音级跨八度不换踏";
+#str_b1="换踏一次";  #str_b2="释放踏板";  #str_b3="恢复默认";
+#str_note="音符 ";  #str_minus="-";  #str_plus="+";
 
 // ---- 音名表（N-4：EEL2 无字符串数组 → 12 个 #string + 算术派生；C4=60 约定）----
 // 派生公式：pc = note % 12；八度 = (note/12|0) - 1。
@@ -579,7 +636,370 @@ function io_process_block() local(bs, i, off, m1, m2, m3) (
 );
 
 /* === M5 诊断 ===（已实现于 @init 前部 M5 节：diag_log / diag_snapshot 须先于最早调用方 io_send_cc_raw 定义，EEL2 先声明后调用） */
-/* === M6 UI ===（T4/T5 填充：ui_draw / ui_widget_* / ui_page_* / ui_draw_text / ui_draw_pedal） */
+
+/* === M6 UI（T4：框架+演奏页；高级/诊断/说明书页 T5 填充；M6 总预算 ≤900 行、T4 ≤550 行）====
+ * 运行态标量登记（EEL2 未定义变量静默为 0，逐一登记；@gfx 线程专用，跨线程标量读容忍 P7/N8）：
+ *   ui_inited（首帧门控）  ui_page（当前页 0..3）  ui_hit_count（本帧登记控件数）
+ *   ui_sc / ui_ox / ui_oy（缩放与内容框偏移，每帧重算）  ui_cap_prev（上帧左键态）
+ *   ui_dn_slot（按下捕获的命中 id，-1=无）  ui_dn_t / ui_rep_t（按下/上次连发时刻，秒，读内置 time_precise，I3）
+ *   ui_ft_sz（ui_draw_text 字号缓存：字号未变则不重复 gfx_setfont；ui_sc 变化时自动失效重设）
+ *   ui_px / ui_py / ui_pw / ui_ph（踏板绘制位与尺寸，页面设置后调 ui_draw_pedal）
+ * 命中区：g_ui_hit@2048[256] = 64 控件 × 4 字段 [x,y,w,h]（N-7）；控件 id 即动作 id，分发 switch 于 ui_act_fire；
+ *   演奏页登记 14 控件 ×4 = 56 槽 ≤ 256（余 50 控件位；T5 三页共用同一容量池，越界静默拒绝并返回 0）。
+ * 线程协议：@gfx 只读业务状态（st_held_total / st_auto_cc / cfg_ 镜像 / 快照 g_diag_snap+2）；
+ *   参数修改全走 cfg_set_param（D1）；命令槽 slider13/14/15 直写不经 automate（D1/D19 例外）；
+ *   恢复默认先 sliderchange(-1) 生成 undo 点再写 C03（D13，仅 @gfx 合法）。
+ * 布局引擎（审核锚定 tests/T4坐标表.md）：等比缩放 ui_sc = min(gfx_w/UI_W0, gfx_h/UI_H0)，下限钳制 UI_SC_MIN；
+ *   内容框居中偏移 ui_ox/ui_oy；全部坐标 = ui_ox + 设计值×ui_sc（设计基准 380×460；760×920 时恰为设计值×2）。
+ * 执行序：@gfx → ui_draw()：首帧门控 → 缩放/清 hit → 背景/标题/页签 → 页内容（随绘制随登记）→ 鼠标状态机。
+ * 绘制基元（审核修复 B1/B2）：文字 = gfx_setfont(1,"Arial",size×ui_sc) 设字号 + gfx_r/g/b 设文字色
+ *   （gfx_set 无字号/0xRRGGBB 形态，B1）；填充圆角矩形 = ui_roundrect_geom / ui_roundrect_fill
+ *   （gfx_roundrect 第 6 参为抗锯齿标志、仅描边无填充，B2；描边一律 gfx_roundrect(...,aa=1)）。
+ * 函数序（先声明后调用，叶子在前）：ui_set_rgb → ui_roundrect_geom → ui_roundrect_fill → ui_hit_clear →
+ *   ui_reg → ui_hit_at → ui_is_repeat → ui_act_fire → ui_draw_text → ui_note_name → 控件库 → 绘制帮助 → 页面 → 帧函数。
+ */
+
+// 图元配色（0xRRGGBB → gfx_r/g/b 0..1 + alpha；全部 gfx 图元与文字色经此设色——B1：文字色即 gfx_r/g/b）
+function ui_set_rgb(hex, alpha) (
+  gfx_r = (hex & 0xFF0000) / 16711680;
+  gfx_g = (hex & 0x00FF00) / 65280;
+  gfx_b = (hex & 0x0000FF) / 255;
+  gfx_a = alpha;
+);
+
+// 圆角矩形几何填充（B2 修复：gfx_roundrect 第 6 参为抗锯齿标志、只描边无填充——填充一律走本函数；
+// 颜色/透明度用当前 gfx_r/g/b/a，调用方先设；中带两块 gfx_rect + 四角 gfx_circle；
+// r 钳制 ≤ 半高——r=半高时四角圆重合，恰退化为胶囊/圆）
+function ui_roundrect_geom(x, y, w, h, r) local(ug_r) (
+  ug_r = r;
+  ug_r > h*0.5 ? ( ug_r = h*0.5; ) : 0;
+  gfx_rect(x, y + ug_r, w, h - ug_r*2, 1);            // 中部横带（全宽）
+  gfx_rect(x + ug_r, y, w - ug_r*2, h, 1);            // 中部竖带（补上下角间区域）
+  gfx_circle(x + ug_r, y + ug_r, ug_r, 0, 1);         // 四角
+  gfx_circle(x + w - ug_r, y + ug_r, ug_r, 0, 1);
+  gfx_circle(x + ug_r, y + h - ug_r, ug_r, 0, 1);
+  gfx_circle(x + w - ug_r, y + h - ug_r, ug_r, 0, 1);
+);
+
+// 填充圆角矩形（主题色 + 不透明；透明填充走 ui_set_rgb + ui_roundrect_geom，如踏板阴影）
+function ui_roundrect_fill(x, y, w, h, r, color) (
+  ui_set_rgb(color, 1);
+  ui_roundrect_geom(x, y, w, h, r);
+);
+
+// 命中区清空（每帧重建起点；首帧初始化亦调用）：64 槽 w 字段清零=未登记，登记数归零
+function ui_hit_clear() local(uc_c) (
+  ui_hit_count = 0;
+  uc_c = 0;
+  while (uc_c < 64) (
+    g_mem[g_ui_hit + (uc_c|0)*4 + 2] = 0;
+    uc_c = uc_c + 1;
+  );
+);
+
+// 命中登记（id 即动作 id）：写 [x,y,w,h] 四字段并计数；成功返回 1，越界静默拒绝返回 0
+function ui_reg(id, x, y, w, h) (
+  id >= 0 && id < 64 ? (
+    g_mem[g_ui_hit + (id|0)*4 + 0] = x;
+    g_mem[g_ui_hit + (id|0)*4 + 1] = y;
+    g_mem[g_ui_hit + (id|0)*4 + 2] = w;
+    g_mem[g_ui_hit + (id|0)*4 + 3] = h;
+    ui_hit_count = ui_hit_count + 1;
+    1;
+  ) : 0;
+);
+
+// 命中测试：遍历本帧登记槽（屏幕坐标），返回命中控件 id，未命中 -1（重叠时后登记者胜；本页布局无重叠）
+function ui_hit_at(mx, my) local(uh_i, uh_f) (
+  uh_f = -1;
+  uh_i = 0;
+  while (uh_i < 64) (
+    g_mem[g_ui_hit + (uh_i|0)*4 + 2] > 0
+      && mx >= g_mem[g_ui_hit + (uh_i|0)*4 + 0]
+      && mx < g_mem[g_ui_hit + (uh_i|0)*4 + 0] + g_mem[g_ui_hit + (uh_i|0)*4 + 2]
+      && my >= g_mem[g_ui_hit + (uh_i|0)*4 + 1]
+      && my < g_mem[g_ui_hit + (uh_i|0)*4 + 1] + g_mem[g_ui_hit + (uh_i|0)*4 + 3] ? (
+      uh_f = uh_i;
+    ) : 0;
+    uh_i = uh_i + 1;
+  );
+  uh_f;
+);
+
+// 连发型控件判定（步进器四钮：按下即触发第一次 + 按住连发；按钮/开关/页签为抬起 fire）
+function ui_is_repeat(id) (
+  id == UI_A_BC_M || id == UI_A_BC_P || id == UI_A_TAIL_M || id == UI_A_TAIL_P ? 1 : 0;
+);
+
+// 动作分发（switch 语义）：参数类全走 cfg_set_param（idx=slider 编号，见 SDS §3）；步进类先算钳制新值、
+// 与现值相同（端点）则跳过——N9：连发在端点不再触发 cfg_set_param/automate；
+// 命令槽三钮直写（D1/D19，不经 automate）；恢复默认先 sliderchange(-1) 再写 C03（D13）
+function ui_act_fire(id) local(af_nv) (
+  id == UI_A_TAB0 ? ( ui_page = 0; )
+  : id == UI_A_TAB1 ? ( ui_page = 1; )
+  : id == UI_A_TAB2 ? ( ui_page = 2; )
+  : id == UI_A_TAB3 ? ( ui_page = 3; )
+  : id == UI_A_EN    ? ( cfg_set_param(1, cfg_enabled > 0 ? 0 : 1); )
+  : id == UI_A_BC_M  ? ( af_nv = max(cfg_bass_ceil - UI_BC_STEP, 0); af_nv != cfg_bass_ceil ? ( cfg_set_param(2, af_nv); ) : 0; )
+  : id == UI_A_BC_P  ? ( af_nv = min(cfg_bass_ceil + UI_BC_STEP, 127); af_nv != cfg_bass_ceil ? ( cfg_set_param(2, af_nv); ) : 0; )
+  : id == UI_A_TAIL_M ? ( af_nv = max(cfg_tail_ms - UI_TAIL_STEP, 0); af_nv != cfg_tail_ms ? ( cfg_set_param(3, af_nv); ) : 0; )
+  : id == UI_A_TAIL_P ? ( af_nv = min(cfg_tail_ms + UI_TAIL_STEP, 8000); af_nv != cfg_tail_ms ? ( cfg_set_param(3, af_nv); ) : 0; )
+  : id == UI_A_CHORD ? ( cfg_set_param(4, cfg_chord > 0 ? 0 : 1); )
+  : id == UI_A_OCT   ? ( cfg_set_param(5, cfg_ign_oct > 0 ? 0 : 1); )
+  : id == UI_A_TAP   ? ( slider13 = 1; )                    // C01 换踏一次：命令槽直写
+  : id == UI_A_REL   ? ( slider14 = 1; )                    // C02 释放踏板：命令槽直写
+  : id == UI_A_RST   ? ( sliderchange(-1); slider15 = 1; )  // C03 恢复默认：先 undo 点再写槽（D13）
+  : 0;
+);
+
+// 文字绘制帮助（align：0=左对齐于 x、1=以 x 居中、2=右对齐于 x；size=设计字号，内部乘 ui_sc；
+// B1 修复：gfx_set 无字号/0xRRGGBB 形态 → 字号走 gfx_setfont 槽 1（Arial，中文由 REAPER 字体回退渲染），
+// 颜色走图元色 gfx_r/g/b（即文字色）；7 档 UI_FS_* ×ui_sc 实际生效；字号带缓存 ui_ft_sz（颜色每次重设）；
+// 每次绘制重新格式化输出——EEL2 串槽复用安全）
+function ui_draw_text(x, y, size, color, text, align) local(ut_w, ut_h, ut_sz) (
+  ut_sz = size * ui_sc;
+  ut_sz != ui_ft_sz ? ( gfx_setfont(1, "Arial", ut_sz); ui_ft_sz = ut_sz; ) : 0;
+  ui_set_rgb(color, 1);
+  align != 0 ? ( gfx_measurestr(text, ut_w, ut_h); ) : 0;
+  gfx_x = x + (align == 1 ? ut_w * -0.5 : align == 2 ? ut_w * -1 : 0);
+  gfx_y = y;
+  gfx_printf("%s", text);
+);
+
+// 音名派生（N-4：复用 #nn0..#nn11 + 算术）：结果写全局槽 #ui_notebuf，调用方以 %s 输出；
+// 八度用 floor 而非向零取整（避免 note<12 时差 1，如 note=11 → B-1）
+function ui_note_name(note) local(un_pc, un_oct) (
+  un_pc = note % 12;
+  un_oct = floor(note / 12) - 1;
+  un_pc == 0  ? sprintf(#ui_notebuf, "%s%d", #nn0,  un_oct)
+  : un_pc == 1  ? sprintf(#ui_notebuf, "%s%d", #nn1,  un_oct)
+  : un_pc == 2  ? sprintf(#ui_notebuf, "%s%d", #nn2,  un_oct)
+  : un_pc == 3  ? sprintf(#ui_notebuf, "%s%d", #nn3,  un_oct)
+  : un_pc == 4  ? sprintf(#ui_notebuf, "%s%d", #nn4,  un_oct)
+  : un_pc == 5  ? sprintf(#ui_notebuf, "%s%d", #nn5,  un_oct)
+  : un_pc == 6  ? sprintf(#ui_notebuf, "%s%d", #nn6,  un_oct)
+  : un_pc == 7  ? sprintf(#ui_notebuf, "%s%d", #nn7,  un_oct)
+  : un_pc == 8  ? sprintf(#ui_notebuf, "%s%d", #nn8,  un_oct)
+  : un_pc == 9  ? sprintf(#ui_notebuf, "%s%d", #nn9,  un_oct)
+  : un_pc == 10 ? sprintf(#ui_notebuf, "%s%d", #nn10, un_oct)
+  : sprintf(#ui_notebuf, "%s%d", #nn11, un_oct);
+);
+
+// 控件：按钮（圆角矩形+居中文字；返回是否登记成功）
+function ui_widget_btn(id, x, y, w, h, label) local(wb_r) (
+  wb_r = ui_reg(id, x, y, w, h);
+  ui_roundrect_fill(x, y, w, h, 6*ui_sc, UI_C_BTN);      // 底（B2：填充走 ui_roundrect_fill）
+  ui_set_rgb(UI_C_LINE, 1);
+  gfx_roundrect(x, y, w, h, 6*ui_sc, 1);                 // 描边（aa=1）
+  ui_draw_text(x + w*0.5, y + (h - 12*ui_sc)*0.5, UI_FS_TXT, UI_C_TXT, label, 1);
+  wb_r;
+);
+
+// 控件：页签（active=卡底+冰蓝下划线+冰蓝文字；inactive=暗文字）
+function ui_widget_tab(id, x, y, w, h, label, active) (
+  ui_reg(id, x, y, w, h);
+  active != 0 ? (
+    ui_roundrect_fill(x, y, w, h, 5*ui_sc, UI_C_CARD);     // 页签底（B2）
+    ui_set_rgb(UI_C_ACC, 1);
+    gfx_rect(x + 6*ui_sc, y + h - 3*ui_sc, w - 12*ui_sc, 2*ui_sc, 1);
+    ui_draw_text(x + w*0.5, y + (h - 12*ui_sc)*0.5, UI_FS_TXT, UI_C_ACC, label, 1);
+  ) : (
+    ui_draw_text(x + w*0.5, y + (h - 12*ui_sc)*0.5, UI_FS_TXT, UI_C_DIM, label, 1);
+  );
+);
+
+// 控件：开关（行卡+左标签+右滑块轨道；val>0=冰蓝轨+旋钮居右，否则灰轨+旋钮居左；高=UI_TGL_H；
+// 卡内偏移 6/34/14/12 为控件库内部小偏移）
+function ui_widget_toggle(id, x, y, w, label, val) local(wt_tx, wt_ty, wt_tw, wt_th, wt_kx) (
+  ui_reg(id, x, y, w, UI_TGL_H*ui_sc);
+  ui_roundrect_fill(x, y, w, UI_TGL_H*ui_sc, 6*ui_sc, UI_C_CARD);        // 行卡底（B2）
+  ui_set_rgb(UI_C_LINE, 1);
+  gfx_roundrect(x, y, w, UI_TGL_H*ui_sc, 6*ui_sc, 1);                    // 描边（aa=1）
+  ui_draw_text(x + 6*ui_sc, y + (UI_TGL_H*ui_sc - 11*ui_sc)*0.5, UI_FS_LBL, UI_C_TXT, label, 0);
+  wt_tw = 34*ui_sc;
+  wt_th = 14*ui_sc;
+  wt_tx = x + w - wt_tw - 6*ui_sc;
+  wt_ty = y + (UI_TGL_H*ui_sc - wt_th)*0.5;
+  ui_roundrect_fill(wt_tx, wt_ty, wt_tw, wt_th, wt_th*0.5, val > 0 ? UI_C_ACC : UI_C_BTN2);   // 轨道（胶囊）
+  val > 0 ? ( wt_kx = wt_tx + wt_tw - 12*ui_sc - ui_sc; ) : ( wt_kx = wt_tx + ui_sc; );
+  ui_roundrect_fill(wt_kx, wt_ty + ui_sc, 12*ui_sc, 12*ui_sc, 6*ui_sc, UI_C_KNOB);            // 旋钮（圆）
+);
+
+// 控件：步进器大参数卡（id=−钮、id+1=+钮；调用前置 #ui_unit 为值后缀串；
+// vstep 为签名占位——步进量在 ui_act_fire 以同源常量 UI_BC_STEP/UI_TAIL_STEP 生效；
+// 卡内偏移 14/12/30/70 为控件库内部小偏移）
+function ui_widget_stepper(id, x, y, w, label, val, vmin, vmax, vstep) local(ws_bx, ws_by, ws_bw, ws_bh) (
+  ui_roundrect_fill(x, y, w, UI_CARD_H*ui_sc, 7*ui_sc, UI_C_CARD);   // 卡底（B2）
+  ui_set_rgb(UI_C_LINE, 1);
+  gfx_roundrect(x, y, w, UI_CARD_H*ui_sc, 7*ui_sc, 1);               // 描边（aa=1）
+  ui_draw_text(x + 14*ui_sc, y + 12*ui_sc, UI_FS_LBL, UI_C_DIM, label, 0);
+  sprintf(#ui_valbuf, "%d %s", val, #ui_unit);       // 值串每次绘制重新格式化（数字+后缀）
+  ui_draw_text(x + w*0.5, y + 30*ui_sc, UI_FS_NUM, UI_C_TXT, #ui_valbuf, 1);
+  ws_bw = UI_STP_W*ui_sc;
+  ws_bh = UI_STP_H*ui_sc;
+  ws_by = y + 70*ui_sc;
+  ws_bx = x + 14*ui_sc;                              // − 按钮
+  ui_reg(id, ws_bx, ws_by, ws_bw, ws_bh);
+  ui_roundrect_fill(ws_bx, ws_by, ws_bw, ws_bh, 5*ui_sc, UI_C_BTN);
+  ui_set_rgb(UI_C_LINE, 1);
+  gfx_roundrect(ws_bx, ws_by, ws_bw, ws_bh, 5*ui_sc, 1);
+  ui_draw_text(ws_bx + ws_bw*0.5, ws_by + (ws_bh - 14*ui_sc)*0.5, UI_FS_SYM, UI_C_TXT, #str_minus, 1);
+  ws_bx = x + w - 14*ui_sc - ws_bw;                  // + 按钮
+  ui_reg(id + 1, ws_bx, ws_by, ws_bw, ws_bh);
+  ui_roundrect_fill(ws_bx, ws_by, ws_bw, ws_bh, 5*ui_sc, UI_C_BTN);
+  ui_set_rgb(UI_C_LINE, 1);
+  gfx_roundrect(ws_bx, ws_by, ws_bw, ws_bh, 5*ui_sc, 1);
+  ui_draw_text(ws_bx + ws_bw*0.5, ws_by + (ws_bh - 14*ui_sc)*0.5, UI_FS_SYM, UI_C_TXT, #str_plus, 1);
+);
+
+// 踏板顶视图（gfx 原语两态；位/尺寸由页面经 ui_px/ui_py/ui_pw/ui_ph 设置，state 非 0=踩下）：
+// 踩下=整体下移 5 设计px + 阴影变浅 + 边框转冰蓝；抬起=阴影深 + 暗描边；配色走主题常量
+function ui_draw_pedal(state) local(pd_dy, pd_sa, pd_ly) (
+  state != 0 ? ( pd_dy = 5*ui_sc; pd_sa = 0.18; ) : ( pd_dy = 0; pd_sa = 0.4; );
+  ui_set_rgb(UI_C_PEDSH, pd_sa);                     // 阴影（先画，被板面覆盖大半；透明度 pd_sa，B2 几何填充）
+  ui_roundrect_geom(ui_px + 4*ui_sc, ui_py + 10*ui_sc + pd_dy, ui_pw, ui_ph, 10*ui_sc);
+  ui_roundrect_fill(ui_px, ui_py + pd_dy, ui_pw, ui_ph, 10*ui_sc, UI_C_PLATE);   // 板面
+  ui_set_rgb(UI_C_PEDLN, 1);                         // 防滑纹三道（内部偏移 12/34/16 保留）
+  pd_ly = 0;
+  while (pd_ly < 3) (
+    gfx_line(ui_px + 12*ui_sc, ui_py + pd_dy + (34 + pd_ly*16)*ui_sc,
+             ui_px + ui_pw - 12*ui_sc, ui_py + pd_dy + (34 + pd_ly*16)*ui_sc);
+    pd_ly = pd_ly + 1;
+  );
+  state != 0 ? ui_set_rgb(UI_C_ACC, 1) : ui_set_rgb(UI_C_LINE, 1);   // 边框：踩下冰蓝高亮
+  gfx_roundrect(ui_px, ui_py + pd_dy, ui_pw, ui_ph, 10*ui_sc, 1);    // 描边（aa=1）
+);
+
+// 标题+副题（每页绘制；Y 锚 I4 常量化）
+function ui_draw_title() (
+  ui_draw_text(ui_ox + UI_M*ui_sc, ui_oy + UI_Y_TITLE*ui_sc, UI_FS_TITLE, UI_C_TXT, #str_title, 0);
+  ui_draw_text(ui_ox + (UI_W0 - UI_M)*ui_sc, ui_oy + UI_Y_SUB*ui_sc, UI_FS_SUB, UI_C_DIM, #str_sub, 2);
+);
+
+// 底部状态行：音符 held_total / CC目标 合成值（held 跨线程标量读 P7/N8；
+// 合成值取快照 g_diag_snap+2，初值 -1 显示 --，T3 审核挂账 N-4）
+function ui_draw_status() local(us_v) (
+  us_v = g_mem[g_diag_snap + 2];
+  us_v < 0 ? sprintf(#ui_stbuf, "%s%d / CC%d --", #str_note, st_held_total, cfg_cc)
+           : sprintf(#ui_stbuf, "%s%d / CC%d %d", #str_note, st_held_total, cfg_cc, us_v);
+  ui_draw_text(ui_ox + UI_M*ui_sc, ui_oy + UI_Y_STATUS*ui_sc, UI_FS_SM, UI_C_DIM, #ui_stbuf, 0);
+);
+
+// 页签栏（四页等宽；本任务仅演奏页有内容，其余 T5 占位）
+function ui_draw_tabs() local(ut_tw, ut_ty, ut_th, ut_wd) (
+  ut_wd = (UI_W0 - UI_M*2 - UI_TAB_G*3) * 0.25;      // 设计 85.5
+  ut_tw = ut_wd * ui_sc;
+  ut_ty = ui_oy + UI_TAB_Y*ui_sc;
+  ut_th = UI_TAB_H*ui_sc;
+  ui_widget_tab(UI_A_TAB0, ui_ox + UI_M*ui_sc, ut_ty, ut_tw, ut_th, #str_t0, ui_page == 0);
+  ui_widget_tab(UI_A_TAB1, ui_ox + (UI_M + ut_wd + UI_TAB_G)*ui_sc, ut_ty, ut_tw, ut_th, #str_t1, ui_page == 1);
+  ui_widget_tab(UI_A_TAB2, ui_ox + (UI_M + (ut_wd + UI_TAB_G)*2)*ui_sc, ut_ty, ut_tw, ut_th, #str_t2, ui_page == 2);
+  ui_widget_tab(UI_A_TAB3, ui_ox + (UI_M + (ut_wd + UI_TAB_G)*3)*ui_sc, ut_ty, ut_tw, ut_th, #str_t3, ui_page == 3);
+);
+
+// 演奏页（plan §4.3）：左列踏板+总开关 / 右列两大参数卡 / 两开关+说明一行 / 底部三按钮+状态行
+function ui_page_perf() local(pp_cx, pp_cw, pp_bwd, pp_by) (
+  // ---- 左列：踏板动画（st_auto_cc>0=踩下；跨线程标量读容忍 P7/N8）----
+  ui_px = ui_ox + (UI_M + (UI_LCOL_W - UI_PED_W)*0.5)*ui_sc;   // 板面左缘 设计 40
+  ui_py = ui_oy + UI_Y_PED*ui_sc;
+  ui_pw = UI_PED_W*ui_sc;
+  ui_ph = UI_PED_H*ui_sc;
+  ui_draw_pedal(st_auto_cc > 0 ? 1 : 0);
+  ui_draw_text(ui_ox + (UI_M + UI_LCOL_W*0.5)*ui_sc, ui_oy + UI_Y_PEDLBL*ui_sc, UI_FS_SM, UI_C_TXT, #str_pl, 1);
+  st_auto_cc > 0 ? ui_draw_text(ui_ox + (UI_M + UI_LCOL_W*0.5)*ui_sc, ui_oy + UI_Y_PEDST*ui_sc, UI_FS_SM, UI_C_ACC, #str_pd, 1)
+                 : ui_draw_text(ui_ox + (UI_M + UI_LCOL_W*0.5)*ui_sc, ui_oy + UI_Y_PEDST*ui_sc, UI_FS_SM, UI_C_DIM, #str_pu, 1);
+  // 总开关（cfg_set_param idx1）
+  ui_widget_toggle(UI_A_EN, ui_ox + UI_M*ui_sc, ui_oy + UI_Y_EN*ui_sc, UI_LCOL_W*ui_sc, #str_en, cfg_enabled);
+  // ---- 右列：两大参数卡（stepper：−=id、+=id+1）----
+  pp_cx = ui_ox + (UI_M + UI_LCOL_W + UI_GAP)*ui_sc;          // 卡左缘 设计 138
+  pp_cw = (UI_W0 - UI_M*2 - UI_LCOL_W - UI_GAP)*ui_sc;        // 卡宽 设计 232
+  ui_note_name(cfg_bass_ceil);                                // 音名 → #ui_notebuf
+  #ui_unit = #ui_notebuf;
+  ui_widget_stepper(UI_A_BC_M, pp_cx, ui_oy + UI_Y_CARD1*ui_sc, pp_cw, #str_bc, cfg_bass_ceil, 0, 127, UI_BC_STEP);
+  #ui_unit = "ms";
+  ui_widget_stepper(UI_A_TAIL_M, pp_cx, ui_oy + UI_Y_CARD2*ui_sc, pp_cw, #str_tl, cfg_tail_ms, 0, 8000, UI_TAIL_STEP);
+  // ---- 两开关 + 说明一行（cfg_set_param idx4/idx5）----
+  pp_cw = (UI_W0 - UI_M*2 - UI_GAP)*0.5*ui_sc;                // 半宽 设计 176
+  ui_widget_toggle(UI_A_CHORD, ui_ox + UI_M*ui_sc, ui_oy + UI_Y_TGLROW*ui_sc, pp_cw, #str_ch, cfg_chord);
+  ui_widget_toggle(UI_A_OCT, ui_ox + (UI_M + (UI_W0 - UI_M*2 - UI_GAP)*0.5 + UI_GAP)*ui_sc, ui_oy + UI_Y_TGLROW*ui_sc, pp_cw, #str_oc, cfg_ign_oct);
+  ui_draw_text(ui_ox + UI_M*ui_sc, ui_oy + UI_Y_HINT*ui_sc, UI_FS_SM, UI_C_DIM, #str_hint, 0);
+  // ---- 底部三按钮（命令槽 D1/D19；恢复默认 sliderchange(-1) 先行 D13）----
+  pp_bwd = (UI_W0 - UI_M*2 - UI_GAP*2)/3;                     // 按钮宽 设计 344/3
+  pp_by = ui_oy + UI_Y_BTN*ui_sc;
+  ui_widget_btn(UI_A_TAP, ui_ox + UI_M*ui_sc, pp_by, pp_bwd*ui_sc, UI_BTN_H*ui_sc, #str_b1);
+  ui_widget_btn(UI_A_REL, ui_ox + (UI_M + pp_bwd + UI_GAP)*ui_sc, pp_by, pp_bwd*ui_sc, UI_BTN_H*ui_sc, #str_b2);
+  ui_widget_btn(UI_A_RST, ui_ox + (UI_M + (pp_bwd + UI_GAP)*2)*ui_sc, pp_by, pp_bwd*ui_sc, UI_BTN_H*ui_sc, #str_b3);
+  // ---- 状态行 ----
+  ui_draw_status();
+);
+
+// 高级设置页（T5 占位）
+function ui_page_adv() (
+  ui_draw_text(ui_ox + UI_W0*0.5*ui_sc, ui_oy + 240*ui_sc, UI_FS_TXT, UI_C_DIM, #str_t5a, 1);
+);
+
+// 诊断页（T5 填充的空函数，本任务仅占位文本）
+function ui_page_diag() (
+  ui_draw_text(ui_ox + UI_W0*0.5*ui_sc, ui_oy + 240*ui_sc, UI_FS_TXT, UI_C_DIM, #str_t5b, 1);
+);
+
+// 说明书页（T5 占位）
+function ui_page_manual() (
+  ui_draw_text(ui_ox + UI_W0*0.5*ui_sc, ui_oy + 240*ui_sc, UI_FS_TXT, UI_C_DIM, #str_t5c, 1);
+);
+
+// 每帧起点：等比缩放（比例+下限钳制）与内容框居中偏移 + 命中区重建起点
+function ui_frame_begin() (
+  ui_sc = min(gfx_w / UI_W0, gfx_h / UI_H0);
+  ui_sc < UI_SC_MIN ? ( ui_sc = UI_SC_MIN; ) : 0;
+  ui_ox = (gfx_w - UI_W0*ui_sc)*0.5;
+  ui_oy = (gfx_h - UI_H0*ui_sc)*0.5;
+  ui_hit_clear();
+);
+
+// 鼠标状态机：上升沿按下（命中捕获；连发型按下即触发第一次）→ 按住跟踪（>350ms 起每 ~100ms 连发）→
+// 抬起 fire（非连发型；连发型抬起不重复触发）。按下捕获语义：按住期间以按下时槽为准（拖出不取消），plan 未规定，记设计自定。
+// 计时用 time_precise（I3 修复：内置 time 为 1 秒粒度，350ms/100ms 阈值需亚毫秒时钟，REAPER 4.60+）
+function ui_handle_mouse() local(hm_cap, hm_id, hm_tp) (
+  hm_cap = mouse_cap & 1;
+  hm_tp = time_precise;                                      // 本帧时刻（亚毫秒，每帧取一次）
+  hm_cap != 0 && ui_cap_prev == 0 ? (                        // 上升沿=按下
+    hm_id = ui_hit_at(mouse_x, mouse_y);
+    ui_dn_slot = hm_id;
+    ui_dn_t = hm_tp;
+    ui_rep_t = hm_tp;
+    ui_is_repeat(hm_id) != 0 ? ( ui_act_fire(hm_id); ) : 0;  // 连发型：第一次立即
+  ) : 0;
+  hm_cap != 0 && ui_cap_prev != 0 && ui_dn_slot >= 0 && ui_is_repeat(ui_dn_slot) != 0 ? (   // 按住跟踪
+    hm_tp - ui_dn_t > 0.35 && hm_tp - ui_rep_t >= 0.1 ? (
+      ui_act_fire(ui_dn_slot);
+      ui_rep_t = hm_tp;
+    ) : 0;
+  ) : 0;
+  hm_cap == 0 && ui_cap_prev != 0 ? (                        // 下降沿=抬起
+    ui_dn_slot >= 0 && ui_is_repeat(ui_dn_slot) == 0 ? ( ui_act_fire(ui_dn_slot); ) : 0;
+    ui_dn_slot = -1;
+  ) : 0;
+  ui_cap_prev = hm_cap;
+);
+
+// 帧主函数（@gfx 唯一入口）：首帧门控初始化 → 缩放/清 hit → 背景/标题/页签 → 页内容 → 鼠标状态机
+function ui_draw() (
+  ui_inited == 0 ? (
+    ui_page = 0;          // 首帧初始化：页=0（演奏页）
+    ui_dn_slot = -1;
+    g_mem[g_diag_snap + 2] = -1;   // N7：未播放时快照合成参考置 -1 → 状态行显示「--」而非 0
+    ui_hit_clear();       // 清 hit 区
+    ui_inited = 1;
+  ) : 0;
+  ui_frame_begin();
+  ui_set_rgb(UI_C_BG, 1);
+  gfx_rect(0, 0, gfx_w, gfx_h, 1);   // 窗底
+  ui_draw_title();
+  ui_draw_tabs();
+  ui_page == 0 ? ui_page_perf() : ui_page == 1 ? ui_page_adv() : ui_page == 2 ? ui_page_diag() : ui_page_manual();
+  ui_handle_mouse();
+);
 
 st_resync_pending = 1;   // D7: 每次播放启动强制首块重同步（plan §4.1/§7.16）
 
@@ -598,4 +1018,4 @@ cfg_sync_from_sliders();
 io_process_block();   // §2.4 全序列：哨兵引导 / 时基 / 沿检测+重同步 / 关态门控 / 命令槽 / midirecv / ped_tick / 收尾+diag 快照
 
 @gfx
-// T4: ui_draw ——（四页全定制 UI；本任务不接线）
+ui_draw();   // T4：UI 框架+演奏页（四页页签；高级/诊断/说明书为 T5 占位）
