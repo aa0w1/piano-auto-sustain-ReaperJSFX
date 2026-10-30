@@ -1,0 +1,156 @@
+/* Piano Auto Sustain — JSFX 实现，分节标记：M1 参数管线 / M2 MIDI I/O / M3 状态机 / M4 踏板调度 / M5 诊断 / M6 UI（后续任务填充）
+   依据：sds.md v1.3（D1–D25）+ plan.md v0.5；当前进度 T1：骨架 + 参数管线 + 基址表。 */
+
+desc:Piano Auto Sustain (MIDI)
+in_pin:none
+out_pin:none
+options:gfx_hz=60
+
+// slider 命名以 - 前缀隐藏（通用界面不显示，仍可自动化/持久化，P4）；默认值写在头部（P1），@init 绝不写 slider（N1）。
+// slider1 启用自动踏板(1) | slider2 低音识别上限(59=B3) | slider3 松弛后延音ms(2400) | slider4 和弦保护(1)
+// slider5 忽略八度变化(1) | slider6 换踏间隙ms(20) | slider7 下踏人性化ms(12) | slider8 低音换踏限流窗ms(250)
+// slider9 重复音限流窗ms(120) | slider10 重复音重踏(1) | slider11 通道作用域(0=全部/1-16=通道)
+// slider12 CC目标(索引0/1/2 → 64/66/67，D9) | slider13~15 命令槽C01/C02/C03(上升沿消费) | slider16 C04_HoldOff(电平住slider，音频直写)
+slider1:1<0,1,1>-P1_AutoEnable
+slider2:59<0,127,1>-P2_BassCeil
+slider3:2400<0,8000,1>-P3_TailMs
+slider4:1<0,1,1>-P4_ChordProtect
+slider5:1<0,1,1>-P5_IgnoreOctave
+slider6:20<0,100,1>-P6_GapMs
+slider7:12<0,50,1>-P7_HumanizeMs
+slider8:250<0,500,1>-P8_BassWindowMs
+slider9:120<0,500,1>-P9_RepeatWindowMs
+slider10:1<0,1,1>-P10_RepeatRepedal
+slider11:0<0,16,1>-P11_ChScope
+slider12:0<0,2,1{64,66,67}>-P12_CCTarget
+slider13:0<0,1,1>-C01_TapRep
+slider14:0<0,1,1>-C02_Release
+slider15:0<0,1,1>-C03_RestoreDefaults
+slider16:0<0,1,1>-C04_HoldOff
+
+@init
+/* === M1 参数管线 === */
+
+// ---- 常量区（T4 在此追加 UI 颜色/布局常量）----
+CC_ON = 127;   // 自动侧踩下值
+CC_OFF = 0;    // 自动侧抬起值
+
+// ---- 音名表（N-4：EEL2 无字符串数组 → 12 个 #string + 算术派生；C4=60 约定）----
+// 派生公式：pc = note % 12；八度 = (note/12|0) - 1。
+// 心算验证 note=59 → pc=59%12=11 → #nn11="B"；八度=(59/12|0)-1 = 4-1 = 3 → "B3" ✓
+#nn0="C";  #nn1="C#"; #nn2="D";  #nn3="D#";
+#nn4="E";  #nn5="F";  #nn6="F#"; #nn7="G";
+#nn8="G#"; #nn9="A";  #nn10="A#"; #nn11="B";
+
+/* ---- 基址登记表（sds §2.3 / D10；EEL2 无 name@addr 语法 → 落地基址常量）----
+ * EEL2 的 [] 为「左侧值 + 括号内值」求和后的绝对寻址（官方文档），命名变量与该内存空间相互独立；
+ * 故以 g_mem=0 作锚：g_mem[基址 + idx] 即 mem[登记地址 + idx]，下标整型一律 …|0（官方建议手动取整）。
+ *   登记记法               基址常量           区间          内容
+ *   st_note_cnt@0[128]    g_note_cnt = 0     0..127       按住计数 per pitch
+ *   st_bass_pc@128[12]    g_bass_pc  = 128   128..139     低音区 pitch-class 按住计数
+ *   st_ch_auto@140[16]    g_ch_auto  = 140   140..155     通道发过自动 CC 标志
+ *   st_out_last@156[16]   g_out_last = 156   156..171     通道上次合成输出值（I-3 按通道去重）
+ *   slot_prev@172[3]      g_slot_prev= 172   172..174     命令槽影子（D19 独立上升沿）
+ *   cc_map@512[3]         g_cc_map   = 512   512..514     CC 目标映射 {64,66,67}（D9）
+ *   ui_hit@2048[256]      g_ui_hit   = 2048  2048..2303   UI hit-test（4页×16控件×4字段，N-7）
+ * 逻辑区间 0..127/128..139/140..155/156..171/172..174/512..514/2048..2303 无重叠；
+ * 后续任务新增数组须先在此登记新基址（避开上列区间并更新本表）。
+ */
+g_mem = 0;        // 锚变量：仅取其值 0 作「左侧值」，使 [g_基址 + idx] 即绝对地址
+g_note_cnt = 0;
+g_bass_pc = 128;
+g_ch_auto = 140;
+g_out_last = 156;
+g_slot_prev = 172;
+g_cc_map = 512;
+g_ui_hit = 2048;
+
+// cc_map 常量表初始化（D9：{64,66,67}；常量数据非运行态，@init 幂等重写，不属于状态清零）
+g_mem[g_cc_map + 0] = 64;
+g_mem[g_cc_map + 1] = 66;
+g_mem[g_cc_map + 2] = 67;
+
+// cfg_* 变量清单（EEL2 未定义变量静默为 0，逐一登记在案）：
+//   12 参数镜像 cfg_enabled cfg_bass_ceil cfg_tail_ms cfg_chord cfg_ign_oct cfg_gap_ms
+//              cfg_hum_ms cfg_win_bass_ms cfg_win_rep_ms cfg_repeat_repedal cfg_ch_scope cfg_cc
+//   5 派生采样数 cfg_tail_smp cfg_gap_smp cfg_hum_smp cfg_win_bass_smp cfg_win_rep_smp
+
+// slider1..12 → 12 个 cfg_ 变量 + 5 个派生采样数（ms→采样：ms*srate*0.001）
+function cfg_sync_from_sliders() (
+  cfg_enabled = slider1;
+  cfg_bass_ceil = slider2;
+  cfg_tail_ms = slider3;
+  cfg_chord = slider4;
+  cfg_ign_oct = slider5;
+  cfg_gap_ms = slider6;
+  cfg_hum_ms = slider7;
+  cfg_win_bass_ms = slider8;
+  cfg_win_rep_ms = slider9;
+  cfg_repeat_repedal = slider10;
+  cfg_ch_scope = slider11;
+  cfg_cc = g_mem[g_cc_map + (slider12|0)];   // D9：索引 0/1/2 → CC 64/66/67
+  cfg_tail_smp     = cfg_tail_ms     * srate * 0.001;
+  cfg_gap_smp      = cfg_gap_ms      * srate * 0.001;
+  cfg_hum_smp      = cfg_hum_ms      * srate * 0.001;
+  cfg_win_bass_smp = cfg_win_bass_ms * srate * 0.001;
+  cfg_win_rep_smp  = cfg_win_rep_ms  * srate * 0.001;
+);
+
+// 程序化写参（EEL2 无 slider[idx] 间接寻址 → if 链直写；D13：写值 + slider_automate + 同步）。
+// 注意：函数体含 slider 写入，但仅在 T2 命令槽 / T4 UI 调用时执行；@init 执行路径不写 slider。
+function cfg_set_param(idx, val) (
+  idx == 1  ? (slider1 = val; slider_automate(slider1))
+  : idx == 2  ? (slider2 = val; slider_automate(slider2))
+  : idx == 3  ? (slider3 = val; slider_automate(slider3))
+  : idx == 4  ? (slider4 = val; slider_automate(slider4))
+  : idx == 5  ? (slider5 = val; slider_automate(slider5))
+  : idx == 6  ? (slider6 = val; slider_automate(slider6))
+  : idx == 7  ? (slider7 = val; slider_automate(slider7))
+  : idx == 8  ? (slider8 = val; slider_automate(slider8))
+  : idx == 9  ? (slider9 = val; slider_automate(slider9))
+  : idx == 10 ? (slider10 = val; slider_automate(slider10))
+  : idx == 11 ? (slider11 = val; slider_automate(slider11))
+  : idx == 12 ? (slider12 = val; slider_automate(slider12))
+  : 0;
+  cfg_sync_from_sliders();
+);
+
+// 恢复默认（C03/D13）：12 参数逐一写回首部默认值 + slider_automate + 同步；undo 点由 @gfx 调用方以 sliderchange(-1) 产生
+function cfg_restore_defaults() (
+  slider1 = 1;    slider_automate(slider1);
+  slider2 = 59;   slider_automate(slider2);
+  slider3 = 2400; slider_automate(slider3);
+  slider4 = 1;    slider_automate(slider4);
+  slider5 = 1;    slider_automate(slider5);
+  slider6 = 20;   slider_automate(slider6);
+  slider7 = 12;   slider_automate(slider7);
+  slider8 = 250;  slider_automate(slider8);
+  slider9 = 120;  slider_automate(slider9);
+  slider10 = 1;   slider_automate(slider10);
+  slider11 = 0;   slider_automate(slider11);
+  slider12 = 0;   slider_automate(slider12);
+  cfg_sync_from_sliders();
+);
+
+/* === M2 MIDI I/O ===（T2 填充：io_process_block / io_dispatch / io_send_synth / io_send_cc_raw / cmd_*） */
+/* === M3 状态机 ===（T2 填充：st_on_note_on / st_on_note_off / st_request_rep / st_reset） */
+/* === M4 踏板调度 ===（T2 填充：ped_rep / ped_press / ped_tick / ped_jitter / win_lookup） */
+/* === M5 诊断 ===（T3 填充：diag_log / diag_snapshot） */
+/* === M6 UI ===（T4/T5 填充：ui_draw / ui_widget_* / ui_page_* / ui_draw_text / ui_draw_pedal） */
+
+cfg_sync_from_sliders();   // D23：@init 末尾无条件同步（只读 slider；采样率变化由 @slider 双保险）
+
+@serialize
+// D7 v1.3：非空占位——仅此一条赋值，不持久化任何变量（用户参数由 slider 自动保存承担；
+// 非空 @serialize 阻止变量清零 → 运行态跨播放启动保留，运行态哨兵由 T2 在 @block 首块安装）
+st_serialize_marker = 1;
+
+@slider
+// 宿主侧参数变化 → 重同步派生状态（D23 双保险；@init 后必随再跑）
+cfg_sync_from_sliders();
+
+@block
+// T2: io_process_block ——（哨兵引导 / 开关沿检测 / 关态门控直通 / 重同步补发 / 命令槽消费 / midirecv 分类 / ped_tick；本任务不接线）
+
+@gfx
+// T4: ui_draw ——（四页全定制 UI；本任务不接线）
