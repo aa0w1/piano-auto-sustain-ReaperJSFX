@@ -816,10 +816,14 @@ function ui_roundrect_geom(x, y, w, h, r) local(ug_r, ug_i, ug_dy, ug_ins) (
   gfx_rect(x + ug_r, y, w - ug_r*2, h, 1);            // 中部竖带（补上下角间区域）
   ug_i = 0;                                            // 四角扫描线：每行 1px 矩形，行内缩 = r − sqrt(r²−dy²)
   while (ug_i < ug_r) (
-    ug_dy = ug_r - ug_i - 0.5;
+    // 顶部两角：dy 自圆心向上递增（首行最窄）；底部两角：dy 自圆心向下递增（首行最宽、末行最窄）——
+    // U3 勘误：原写法底部误用顶部公式（用户实测「下角显示成上角」）
+    ug_dy = ug_r - ug_i - 0.5;                         // 顶部行距圆心的垂直距离
     ug_ins = ug_r - sqrt(max(0, ug_r*ug_r - ug_dy*ug_dy));
     gfx_rect(x + ug_ins, y + ug_i, ug_r - ug_ins + 0.5, 1);              // 左上
     gfx_rect(x + w - ug_r, y + ug_i, ug_r - ug_ins + 0.5, 1);            // 右上
+    ug_dy = ug_i + 0.5;                                // 底部行距圆心的垂直距离（镜像）
+    ug_ins = ug_r - sqrt(max(0, ug_r*ug_r - ug_dy*ug_dy));
     gfx_rect(x + ug_ins, y + h - ug_r + ug_i, ug_r - ug_ins + 0.5, 1);   // 左下
     gfx_rect(x + w - ug_r, y + h - ug_r + ug_i, ug_r - ug_ins + 0.5, 1); // 右下
     ug_i = ug_i + 1;
