@@ -802,20 +802,28 @@ function ui_grad_h(x, y, w, h, c1, c2) local(gh_r, gh_g, gh_b) (
 );
 
 // 圆角矩形几何填充（B2 修复：gfx_roundrect 第 6 参为抗锯齿标志、只描边无填充——填充一律走本函数；
-// 颜色/透明度用当前 gfx_r/g/b/a，调用方先设；中带两块 gfx_rect + 四角 gfx_circle；
-// 四角圆参数 (1,1)：官方签名 gfx_circle(x,y,r[,fill,antialias])——fill 在前 antialias 在后，
-// 旧写法 (0,1) 实为「空心描边圈」（用户实测四角露出象牙扇形）；(1,1) 在两种参数顺序解读下语义一致，
-// 实心填充 + 抗锯齿平滑边缘；
+// 颜色/透明度用当前 gfx_r/g/b/a，调用方先设；中带两块 gfx_rect + 四角扫描线；
+// U3 勘误：四角曾用 gfx_circle(fill,aa)——先实测 (0,1) 为空心描边圈（官方签名 [,fill,antialias] 顺序误读），
+// 改 (1,1) 后又发现其抗锯齿填充不遵守 gfx_a（半透明卡片四角呈全不透明亮扇形，用户截图证据；
+// 官方文档/论坛均无记载）——四角改为逐行 1px 矩形扫描线（与踏板面同款技法），gfx_rect 透明度行为
+// 经全 UI 验证可靠；每形状增加 4×r 个 1px 矩形（ui_sc=2.5 时 ≤70 个/形状，开销可忽略）；
 // r 钳制 ≤ 半高——r=半高时四角圆重合，恰退化为胶囊/圆）
-function ui_roundrect_geom(x, y, w, h, r) local(ug_r) (
+function ui_roundrect_geom(x, y, w, h, r) local(ug_r, ug_i, ug_dy, ug_ins) (
   ug_r = r;
   ug_r > h*0.5 ? ( ug_r = h*0.5; ) : 0;
+  ug_r > w*0.5 ? ( ug_r = w*0.5; ) : 0;
   gfx_rect(x, y + ug_r, w, h - ug_r*2, 1);            // 中部横带（全宽）
   gfx_rect(x + ug_r, y, w - ug_r*2, h, 1);            // 中部竖带（补上下角间区域）
-  gfx_circle(x + ug_r, y + ug_r, ug_r, 1, 1);         // 四角（fill=1 + aa=1，参数顺序双保险）
-  gfx_circle(x + w - ug_r, y + ug_r, ug_r, 1, 1);
-  gfx_circle(x + ug_r, y + h - ug_r, ug_r, 1, 1);
-  gfx_circle(x + w - ug_r, y + h - ug_r, ug_r, 1, 1);
+  ug_i = 0;                                            // 四角扫描线：每行 1px 矩形，行内缩 = r − sqrt(r²−dy²)
+  while (ug_i < ug_r) (
+    ug_dy = ug_r - ug_i - 0.5;
+    ug_ins = ug_r - sqrt(max(0, ug_r*ug_r - ug_dy*ug_dy));
+    gfx_rect(x + ug_ins, y + ug_i, ug_r - ug_ins + 0.5, 1);              // 左上
+    gfx_rect(x + w - ug_r, y + ug_i, ug_r - ug_ins + 0.5, 1);            // 右上
+    gfx_rect(x + ug_ins, y + h - ug_r + ug_i, ug_r - ug_ins + 0.5, 1);   // 左下
+    gfx_rect(x + w - ug_r, y + h - ug_r + ug_i, ug_r - ug_ins + 0.5, 1); // 右下
+    ug_i = ug_i + 1;
+  );
 );
 
 // 填充圆角矩形（主题色 + 不透明；透明填充走 ui_set_rgb + ui_roundrect_geom，如踏板阴影）
@@ -1178,31 +1186,18 @@ function ui_widget_stprow(id, x, y, w, label, valtext, serif) local(sr_bw, sr_bh
   ui_draw_text(sr_bx + sr_bw*0.5, y + (sr_bh - 14*ui_sc)*0.5, UI_FS_SYM, UI_C_TITLE, #str_minus, 1);
 );
 
-// 侧视琴架踏板（U1 核心重绘；lyre 120×118，原点 ui_px/ui_py，设计几何全在 lyre 内；state 非 0=踩下：
-// 仅板面下沉 9 设计px + 状态字变色——阴影两态恒定（审核 I2：删除规格外的 ×0.93/α.38/+1px）；
-// 无旋转——mockup 的 ±9° 杆倾角用斜线段、2.5° 板面倾角略去，偏离记录）：
-// 两根斜拉银杆（6×52，顶 6：6 条 1px 斜线并排成杆宽，逐条配色近似 90° 三停渐变；±9°→顶端水平内收 8.2）+
-// 中央立柱 8×44（横渐变三停）+ 椭圆阴影 110×7（逐行 1px 矩形）+ 踏板面 92×26 圆角 12/9
+// 侧视踏板（U3 简化：删除原两根斜拉杆——用户反馈「三根柱子」辨识度差；经典单立柱+踏板侧视；
+// lyre 120×118，原点 ui_px/ui_py，设计几何全在 lyre 内；state 非 0=踩下：
+// 仅板面下沉 9 设计px + 状态字变色——阴影两态恒定（审核 I2：删除规格外的 ×0.93/α.38/+1px））：
+// 中央立柱 8×90（横渐变三停，直落踏板面顶，被板面遮住下端）+
+// 椭圆阴影 110×7（逐行 1px 矩形）+ 踏板面 92×26 圆角 12/9
 // （逐行 1px 矩形：行色=垂直三停插值+圆形角内缩——圆角与渐变 gfx_gradrect 单矩形无法同表，见 M6 头注释）+
 // 黄铜嵌线 68×3（水平三停）
 function ui_draw_pedal(state) local(pd_i, pd_n, pd_dy, pd_hw, pd_t, pd_ins, pd_plx, pd_ply, pd_y,
                                     pd_r1, pd_g1, pd_b1, pd_r2, pd_g2, pd_b2, pd_r3, pd_g3, pd_b3) (
-  // ---- 斜拉银杆 ×2（底左 x=26 / 镜像 88，底 y=58；顶端内收 8.2≈52×tan9°，倾向中柱）----
-  pd_y = ui_py + 6*ui_sc;
-  pd_i = 0;
-  while (pd_i < 6) (
-    pd_i == 0 ? ui_set_rgb(0x8F8F94, 1)
-    : pd_i == 1 ? ui_set_rgb(0xB9B9BF, 1)
-    : pd_i <= 3 ? ui_set_rgb(0xD9D9DE, 1)
-    : pd_i == 4 ? ui_set_rgb(0x9D9DA4, 1)
-    : ui_set_rgb(0x7C7C83, 1);
-    gfx_line(ui_px + (26 + pd_i)*ui_sc, ui_py + 58*ui_sc, ui_px + (34.2 + pd_i)*ui_sc, pd_y);
-    gfx_line(ui_px + (88 + pd_i)*ui_sc, ui_py + 58*ui_sc, ui_px + (79.8 + pd_i)*ui_sc, pd_y);
-    pd_i = pd_i + 1;
-  );
-  // ---- 中央立柱 8×44（90° 三停 #9c9ca0→#e4e4e8 45%→#83838a：3.6+4.4 两段）----
-  ui_grad_h(ui_px + 56*ui_sc, ui_py, 3.6*ui_sc, 44*ui_sc, UI_C_STEM1, UI_C_STEM2);
-  ui_grad_h(ui_px + 59.6*ui_sc, ui_py, 4.4*ui_sc, 44*ui_sc, UI_C_STEM2, UI_C_STEM3);
+  // ---- 中央立柱 8×90（90° 三停 #9c9ca0→#e4e4e8 45%→#83838a：3.6+4.4 两段；下端被踏板面覆盖）----
+  ui_grad_h(ui_px + 56*ui_sc, ui_py, 3.6*ui_sc, 90*ui_sc, UI_C_STEM1, UI_C_STEM2);
+  ui_grad_h(ui_px + 59.6*ui_sc, ui_py, 4.4*ui_sc, 90*ui_sc, UI_C_STEM2, UI_C_STEM3);
   // ---- 椭圆阴影 110×7（bottom −4 → 顶 115；两态恒定——审核 I2）----
   pd_n = floor(7*ui_sc);
   pd_y = ui_py + 115*ui_sc;
