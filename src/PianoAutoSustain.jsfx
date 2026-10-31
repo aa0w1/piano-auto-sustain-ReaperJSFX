@@ -803,16 +803,19 @@ function ui_grad_h(x, y, w, h, c1, c2) local(gh_r, gh_g, gh_b) (
 
 // 圆角矩形几何填充（B2 修复：gfx_roundrect 第 6 参为抗锯齿标志、只描边无填充——填充一律走本函数；
 // 颜色/透明度用当前 gfx_r/g/b/a，调用方先设；中带两块 gfx_rect + 四角 gfx_circle；
+// 四角圆参数 (1,1)：官方签名 gfx_circle(x,y,r[,fill,antialias])——fill 在前 antialias 在后，
+// 旧写法 (0,1) 实为「空心描边圈」（用户实测四角露出象牙扇形）；(1,1) 在两种参数顺序解读下语义一致，
+// 实心填充 + 抗锯齿平滑边缘；
 // r 钳制 ≤ 半高——r=半高时四角圆重合，恰退化为胶囊/圆）
 function ui_roundrect_geom(x, y, w, h, r) local(ug_r) (
   ug_r = r;
   ug_r > h*0.5 ? ( ug_r = h*0.5; ) : 0;
   gfx_rect(x, y + ug_r, w, h - ug_r*2, 1);            // 中部横带（全宽）
   gfx_rect(x + ug_r, y, w - ug_r*2, h, 1);            // 中部竖带（补上下角间区域）
-  gfx_circle(x + ug_r, y + ug_r, ug_r, 0, 1);         // 四角
-  gfx_circle(x + w - ug_r, y + ug_r, ug_r, 0, 1);
-  gfx_circle(x + ug_r, y + h - ug_r, ug_r, 0, 1);
-  gfx_circle(x + w - ug_r, y + h - ug_r, ug_r, 0, 1);
+  gfx_circle(x + ug_r, y + ug_r, ug_r, 1, 1);         // 四角（fill=1 + aa=1，参数顺序双保险）
+  gfx_circle(x + w - ug_r, y + ug_r, ug_r, 1, 1);
+  gfx_circle(x + ug_r, y + h - ug_r, ug_r, 1, 1);
+  gfx_circle(x + w - ug_r, y + h - ug_r, ug_r, 1, 1);
 );
 
 // 填充圆角矩形（主题色 + 不透明；透明填充走 ui_set_rgb + ui_roundrect_geom，如踏板阴影）
@@ -1299,7 +1302,7 @@ function ui_draw_title() (
   ui_draw_text_ls(ui_ox + 14*ui_sc, ui_oy + UI_Y_SUB*ui_sc, UI_FS_SUB2, UI_C_BRASS, 0, 1.2, 0.55);   // .t-sub opacity .55
   ui_reg(UI_A_EN, ui_ox + 336*ui_sc, ui_oy + 22*ui_sc, 34*ui_sc, 30*ui_sc);
   cfg_enabled > 0 ? ui_set_rgb(UI_C_LEDON, 1) : ui_set_rgb(UI_C_LEDOFF, 1);
-  gfx_circle(ui_ox + 362.5*ui_sc, ui_oy + (UI_Y_LED + 3.5)*ui_sc, 3.5*ui_sc, 0, 1);
+  gfx_circle(ui_ox + 362.5*ui_sc, ui_oy + (UI_Y_LED + 3.5)*ui_sc, 3.5*ui_sc, 1, 1);   // LED 实心点（fill=1+aa=1，同 geom 修复）
   cfg_enabled > 0 ? ( #ui_lsstr = #str_on; ) : ( #ui_lsstr = #str_off; );
   cfg_enabled > 0 ? ui_draw_text_ls(ui_ox + 366*ui_sc, ui_oy + UI_Y_ON*ui_sc, UI_FS_SUB2, UI_C_BRASS, 2, 1.2, 0.55)   // .t-sub .55
                   : ui_draw_text_ls(ui_ox + 366*ui_sc, ui_oy + UI_Y_ON*ui_sc, UI_FS_SUB2, UI_C_LEDOFF, 2, 1.2, 0.55);
