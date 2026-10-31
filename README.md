@@ -60,7 +60,6 @@
 |---|---|
 | [docs/使用说明.md](docs/使用说明.md) | 安装、功能详解、低音锚定调参、FAQ |
 | [docs/首载检查单.md](docs/首载检查单.md) | 首次安装 5 分钟验证清单 |
-| [docs/GitHub入门.md](docs/GitHub入门.md) | 本仓库的 GitHub 使用入门（写给仓库主人） |
 | [tests/测试清单.md](tests/测试清单.md) | 18 场景功能验收表 |
 
 ## 📄 License
